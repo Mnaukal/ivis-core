@@ -1,7 +1,8 @@
 'use strict';
 
 import React, {Component} from "react";
-import {createBase, isSignalVisible, RenderStatus, TimeBasedChartBase} from "./TimeBasedChartBase";
+import {createBase, isSignalVisible, TimeBasedChartBase} from "./TimeBasedChartBase";
+import {RenderStatus} from "./common.js";
 import {getAxisIdx, LineChartBase, pointsOnNoAggregation} from "./LineChartBase";
 import {select} from "d3-selection";
 import * as d3Shape from "d3-shape";

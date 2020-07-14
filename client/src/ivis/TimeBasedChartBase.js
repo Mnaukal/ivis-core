@@ -17,7 +17,7 @@ import * as dateMath from "../lib/datemath";
 import {Icon} from "../lib/bootstrap-components";
 import {withComponentMixins} from "../lib/decorator-helpers";
 import {withTranslation} from "../lib/i18n";
-import {setZoomTransform, transitionInterpolate, WheelDelta} from "./common";
+import {setZoomTransform, transitionInterpolate, WheelDelta, RenderStatus} from "./common";
 import * as d3Zoom from "d3-zoom";
 
 export function createBase(base, self) {
@@ -88,12 +88,6 @@ class TooltipContent extends Component {
         }
     }
 }
-
-export const RenderStatus = {
-    SUCCESS: 0,
-    NO_DATA: 1
-};
-
 
 
 export const ConfigDifference = {
@@ -380,7 +374,7 @@ export class TimeBasedChartBase extends Component {
             });
         }
 
-        if (!forceRefresh && width === this.renderedWidth) {
+        if (!forceRefresh && width === this.renderedWidth) { // FIXME? this.renderedWidth has same meaning as this.state.width ?
             return;
         }
         this.renderedWidth = width;

@@ -141,3 +141,8 @@ export function setZoomTransform(self, setStateCallback) {
 }
 
 export const ZoomEventSources = ["mousemove", "dblclick", "wheel", "touchstart", "touchmove" ]; // source: https://github.com/d3/d3-zoom#api-reference (table with events - causing "zoom" event)
+
+export const RenderStatus = {
+    SUCCESS: 0,
+    NO_DATA: 1
+};

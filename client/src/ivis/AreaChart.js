@@ -3,8 +3,8 @@
 import React, {Component} from "react";
 import {
     isSignalVisible,
-    RenderStatus
 } from "./TimeBasedChartBase";
+import {RenderStatus} from "./common.js";
 import {getAxisIdx, LineChartBase} from "./LineChartBase";
 import {select} from "d3-selection";
 import * as d3Shape

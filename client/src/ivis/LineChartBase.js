@@ -1,7 +1,8 @@
 'use strict';
 
 import React, {Component} from "react";
-import {createBase, isSignalVisible, RenderStatus, TimeBasedChartBase} from "./TimeBasedChartBase";
+import {createBase, isSignalVisible, TimeBasedChartBase} from "./TimeBasedChartBase";
+import {RenderStatus} from "./common.js";
 import * as d3Axis from "d3-axis";
 import * as d3Scale from "d3-scale";
 import * as d3Array from "d3-array";
