@@ -149,22 +149,18 @@ export class XZoomableChartBase extends Component {
         const xSize = width - this.props.margin.left - this.props.margin.right;
         this.xSize = xSize;
 
-        // update xScale with zoom, draw it later
-        let xScale = this.props.getXScale(/* range: */ [0, xSize]);
-        this.originalXScale = xScale;
-        xScale = this.state.zoomTransform.rescaleX(xScale);
-        this.xScale = xScale;
+        // update xScale with zoom, draw it later; sets this.xScale
+        this.updateXScale(xSize);
 
         // prepare the data in the child - update it according to the new xScale
         if (this.props.prepareChart)
-            this.props.prepareChart(this, forceRefresh || widthChanged, updateZoom, xScale, xSize, ySize);
+            this.props.prepareChart(this, forceRefresh || widthChanged, updateZoom, this.xScale, xSize, ySize);
 
         // get yScale
-        const yScale = this.props.getYScale(/* range: */ [this.ySize, 0]);
-        this.yScale = yScale;
+        this.yScale = this.props.getYScale(/* range: */ [this.ySize, 0]);
 
         // everything is prepared, now call the createChart method of the child
-        const renderStatus = this.props.createChart(this, forceRefresh || widthChanged, updateZoom, xScale, yScale, xSize, ySize);
+        const renderStatus = this.props.createChart(this, forceRefresh || widthChanged, updateZoom, this.xScale, this.yScale, xSize, ySize);
         if (renderStatus !== this.state.renderStatus)
             this.setState({renderStatus});
         if (renderStatus === RenderStatus.NO_DATA)
@@ -183,6 +179,18 @@ export class XZoomableChartBase extends Component {
             if (this.props.withZoom)
                 this.createChartZoom(xSize, ySize);
         }
+    }
+
+    updateXScale(xSize) {
+        let xScale = this.props.getXScale(/* range: */ [0, xSize]);
+        this.originalXScale = xScale;
+
+        if (xScale.rescaleX)
+            xScale = this.state.zoomTransform.rescaleX(xScale);
+        else
+            xScale.range(xScale.range().map(d => this.state.zoomTransform.applyX(d)))
+
+        this.xScale = xScale;
     }
 
     drawXAxis() {
@@ -423,15 +431,20 @@ export class XZoomableChartBase extends Component {
                                 <clipPath id="plotRect">
                                     <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.height - this.props.margin.top - this.props.margin.bottom} />
                                 </clipPath>
+                                <clipPath id="bottomAxis">
+                                    <rect x={-6} y={0} width={this.state.width - this.props.margin.left - this.props.margin.right + 6}
+                                          height={this.props.margin.bottom} /* same reason for 6 as in HeatmapChart */ />
+                                </clipPath>
                             </defs>
                             <g /* Graph content */ transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" >
                                 {this.props.getGraphContent(this, this.xScale, this.yScale, this.xSize, this.ySize)}
                             </g>
 
                             {/* axes */}
-                            <g ref={node => this.xAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.height - this.props.margin.bottom})`}/>
+                            <g ref={node => this.xAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.height - this.props.margin.bottom})`} clipPath="url(#bottomAxis)" />
                             <text ref={node => this.xAxisLabelSelection = select(node)}
                                   transform={`translate(${this.props.margin.left + (this.state.width - this.props.margin.left - this.props.margin.right) / 2}, ${this.props.height - 5})`} />
+
                             <g ref={node => this.yAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
                             <text ref={node => this.yAxisLabelSelection = select(node)}
                                   transform={`translate(${15}, ${this.props.margin.top + (this.props.height - this.props.margin.top - this.props.margin.bottom) / 2}) rotate(-90)`} />
