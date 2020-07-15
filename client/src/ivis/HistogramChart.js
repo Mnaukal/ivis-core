@@ -118,6 +118,7 @@ export class HistogramChart extends Component {
         withOverview: PropTypes.bool,
         withTransition: PropTypes.bool,
         withZoom: PropTypes.bool,
+        withBrush: PropTypes.bool,
         tooltipFormat: PropTypes.func, // bucket => line in tooltip
 
         xAxisTicksCount: PropTypes.number,
@@ -156,6 +157,7 @@ export class HistogramChart extends Component {
         withOverview: true,
         withTransition: true,
         withZoom: true,
+        withBrush: true,
         tooltipFormat: bucket => `Count: ${bucket.count}`,
 
         zoomLevelMin: 1,
@@ -649,11 +651,12 @@ export class HistogramChart extends Component {
 
                 height={this.props.height}
                 margin={this.props.margin}
-                withOverview={this.props.withOverview}
+                withOverviewX={this.props.withOverview}
                 overviewHeight={this.props.overviewHeight}
                 overviewMargin={this.props.overviewMargin}
                 withTransition={this.props.withTransition}
                 withZoom={this.props.withZoom}
+                withBrush={this.props.withBrush}
 
                 getXScale={::this.getXScale}
                 getYScale={::this.getYScale}

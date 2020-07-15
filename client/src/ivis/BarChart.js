@@ -250,7 +250,7 @@ export class StaticBarChart extends Component {
 
                 height={this.props.height}
                 margin={this.props.margin}
-                withOverview={false}
+                withOverviewX={false}
                 withTransition={this.props.withTransition}
                 withZoom={this.props.withZoom}
 

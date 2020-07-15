@@ -24,7 +24,7 @@ import {
 @withComponentMixins([
     withTranslation,
     withErrorHandling
-], ["getView", "setView", "getZoomTransform", "resetZoom", "createChart", "callViewChangeCallback"])
+], ["getView", "setView", "getZoomTransform", "resetZoom", "createChart", "callViewChangeCallback", "setBrushEnabled"])
 export class XZoomableChartBase extends Component {
     constructor(props){
         super(props);
@@ -33,14 +33,15 @@ export class XZoomableChartBase extends Component {
 
         this.state = {
             zoomTransform: d3Zoom.zoomIdentity,
-            width: 0
+            width: 0,
+            brushInProgress: false,
         };
 
         this.xSize = 0;
         this.ySize = 0;
 
         this.zoom = null;
-        this.brush = null;
+        this.brushX = null;
         this.lastZoomCausedByUser = false;
 
         this.resizeListener = () => {
@@ -52,12 +53,14 @@ export class XZoomableChartBase extends Component {
         height: PropTypes.number.isRequired,
         margin: PropTypes.object,
 
-        withOverview: PropTypes.bool,
+        withOverviewX: PropTypes.bool,
+        withOverviewXBrush: PropTypes.bool,
         overviewHeight: PropTypes.number,
         overviewMargin: PropTypes.object,
 
         withTransition: PropTypes.bool,
         withZoom: PropTypes.bool,
+        withBrush: PropTypes.bool,
 
         getXScale: PropTypes.func.isRequired,
         getYScale: PropTypes.func, // can be called repeatedly
@@ -95,9 +98,11 @@ export class XZoomableChartBase extends Component {
     static defaultProps = {
         margin: { left: 40, right: 5, top: 5, bottom: 40 },
 
-        withOverview: true,
+        withOverviewX: true,
+        withOverviewXBrush: true,
         withTransition: true,
         withZoom: true,
+        withBrush: true,
 
         zoomLevelMin: 1,
         zoomLevelMax: 4,
@@ -115,12 +120,14 @@ export class XZoomableChartBase extends Component {
 
     componentDidMount() {
         window.addEventListener('resize', this.resizeListener);
+        window.addEventListener('keydown', ::this.keydownListener);
+        window.addEventListener('keyup', ::this.keyupListener);
         this.createChart(false, false);
     }
 
     /** Update and redraw the chart based on changes in React props and state */
     componentDidUpdate(prevProps, prevState) {
-        const forceRefresh = this.prevContainerNode !== this.containerNode;
+        const forceRefresh = this.prevContainerNode !== this.containerNode || prevState.brushInProgress !== this.state.brushInProgress;
         const updateZoom = !Object.is(prevState.zoomTransform, this.state.zoomTransform);
 
         this.createChart(forceRefresh, updateZoom);
@@ -131,6 +138,8 @@ export class XZoomableChartBase extends Component {
 
     componentWillUnmount() {
         window.removeEventListener('resize', this.resizeListener);
+        window.removeEventListener('keydown', ::this.keydownListener);
+        window.removeEventListener('keyup', ::this.keyupListener);
     }
 
     /** Creates (or updates) the chart with current data.
@@ -171,13 +180,14 @@ export class XZoomableChartBase extends Component {
         this.drawYAxis();
 
         // and the rest of the chart
-        if (this.props.withOverview) {
-            this.createChartOverview(xSize);
+        if (this.props.withOverviewX) {
+            this.createChartOverviewX(xSize);
         }
         // we don't want to change zoom object when updating only zoom (it breaks touch drag)
-        if (forceRefresh || widthChanged) {
-            if (this.props.withZoom)
-                this.createChartZoom(xSize, ySize);
+        if ((forceRefresh || widthChanged) && this.props.withZoom)
+            this.createChartZoom(xSize, ySize);
+        if (this.props.withBrush) {
+            this.createChartBrush(xSize, ySize);
         }
     }
 
@@ -185,12 +195,10 @@ export class XZoomableChartBase extends Component {
         let xScale = this.props.getXScale(/* range: */ [0, xSize]);
         this.originalXScale = xScale;
 
-        if (xScale.rescaleX)
-            xScale = this.state.zoomTransform.rescaleX(xScale);
+        if (typeof xScale.invert === "function")
+            this.xScale = this.state.zoomTransform.rescaleX(xScale);
         else
-            xScale.range(xScale.range().map(d => this.state.zoomTransform.applyX(d)))
-
-        this.xScale = xScale;
+            this.xScale = xScale.copy().range(xScale.range().map(d => this.state.zoomTransform.applyX(d)))
     }
 
     drawXAxis() {
@@ -304,7 +312,7 @@ export class XZoomableChartBase extends Component {
     }
 
     /** Sets zoom object (transform) to desired view boundaries. */
-    setZoomToLimits(xMin, xMax) {
+    setZoomToLimits(xMin, xMax) { // TODO non-numerical signals
         if (this.brush) {
             this.overviewBrushSelection.call(this.brush.move, [this.originalXScale(xMin), this.originalXScale(xMax)]);
             // brush will also adjust zoom if sourceEvent is not "zoom" caused by this.zoom which is true when this method is called from this.setView
@@ -317,6 +325,22 @@ export class XZoomableChartBase extends Component {
             const transform = d3Zoom.zoomIdentity.scale(this.state.zoomTransform.k * oldXSize / newXSize).translate(-leftInverted, 0);
 
             this.setZoom(transform);
+        }
+    }
+
+    /** Sets zoom object (transform) to desired view boundaries in pixels. */
+    setZoomToPixels(left, right) {
+        if (left >= 0 && right <= this.xSize) {
+            if (this.brushX) {
+                this.overviewBrushSelection.call(this.brushX.move, [this.state.zoomTransform.invertX(left), this.state.zoomTransform.invertX(right)]);
+                // brush will also adjust zoom if sourceEvent is not "zoom" caused by this.zoom which is true when this method is called from this.setView
+            } else {
+                const newXSize = right - left;
+                const leftInverted = this.state.zoomTransform.invertX(left);
+                const transform = d3Zoom.zoomIdentity.scale(this.state.zoomTransform.k * this.xSize / newXSize).translate(-leftInverted, 0);
+
+                this.setZoom(transform);
+            }
         }
     }
 
@@ -341,8 +365,8 @@ export class XZoomableChartBase extends Component {
 
     /** Updates overview brushes from zoom transform. */
     moveBrush(transform) {
-        if (this.brush)
-            this.overviewBrushSelection.call(this.brush.move, this.defaultBrush.map(transform.invertX, transform));
+        if (this.brushX)
+            this.overviewBrushSelection.call(this.brushX.move, this.defaultBrush.map(transform.invertX, transform));
     };
 
     /**
@@ -357,7 +381,7 @@ export class XZoomableChartBase extends Component {
 
     /** Creates d3-brush for overview.
      *  Called from this.createChart(). */
-    createChartOverview(xSize) {
+    createChartOverviewX(xSize) {
         const self = this;
 
         // axis
@@ -370,46 +394,109 @@ export class XZoomableChartBase extends Component {
         }
 
         // brush
-        const overviewYSize = this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom;
-        this.overviewYSize = overviewYSize;
-        this.defaultBrush = [0, xSize];
-        const brushExisted = this.brush !== null;
-        this.brush = brushExisted ? this.brush :d3Brush.brushX();
-        this.brush
-            .extent([[0, 0], [xSize, overviewYSize]])
-            .handleSize(20)
-            .on("brush", function () {
-                // noinspection JSUnresolvedVariable
-                const sel = d3Event.selection;
-                self.overviewBrushSelection.call(brushHandlesLeftRight, sel, overviewYSize);
+        const overviewX_ySize = this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom;
+        this.overviewX_ySize = overviewX_ySize;
 
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "zoom" && d3Event.sourceEvent.target === self.zoom) return; // ignore brush-by-zoom
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && d3Event.sourceEvent.target === self.brush) return; // ignore brush by itself
+        if (this.props.withOverviewXBrush) {
+            this.defaultBrush = [0, xSize];
+            const brushExisted = this.brushX !== null;
+            this.brushX = brushExisted ? this.brushX : d3Brush.brushX(); // this is permanent brush in the overview
+            this.brushX
+                .extent([[0, 0], [xSize, overviewX_ySize]])
+                .handleSize(20)
+                .on("brush", function () {
+                    // noinspection JSUnresolvedVariable
+                    const sel = d3Event.selection;
+                    self.overviewBrushSelection.call(brushHandlesLeftRight, sel, overviewX_ySize);
 
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                    self.lastZoomCausedByUser = true;
+                    // noinspection JSUnresolvedVariable
+                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "zoom" && d3Event.sourceEvent.target === self.zoom) return; // ignore brush-by-zoom
+                    // noinspection JSUnresolvedVariable
+                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && d3Event.sourceEvent.target === self.brushX) return; // ignore brush by itself
 
-                const newTransform = d3Zoom.zoomIdentity.scale(xSize / (sel[1] - sel[0])).translate(-sel[0], 0);
-                self.setZoom(newTransform);
-            });
+                    // noinspection JSUnresolvedVariable
+                    if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
+                        self.lastZoomCausedByUser = true;
 
-        this.overviewBrushSelection
-            .attr('pointer-events', 'all')
-            .call(this.brush);
-        if (!brushExisted)
-            this.overviewBrushSelection.call(this.brush.move, this.defaultBrush);
-        this.overviewBrushSelection.select(".selection")
-            .classed(styles.selection, true);
-        this.overviewBrushSelection.select(".overlay")
-            .attr('pointer-events', 'none');
+                    const newTransform = d3Zoom.zoomIdentity.scale(xSize / (sel[1] - sel[0])).translate(-sel[0], 0);
+                    self.setZoom(newTransform);
+                });
+
+            this.overviewBrushSelection
+                .attr('pointer-events', 'all')
+                .call(this.brushX);
+            if (!brushExisted)
+                this.overviewBrushSelection.call(this.brushX.move, this.defaultBrush);
+            this.overviewBrushSelection.select(".selection")
+                .classed(styles.selection, true);
+            this.overviewBrushSelection.select(".overlay")
+                .attr('pointer-events', 'none');
+        }
 
         // call createChartOverview method in child to update the overview
         if (this.props.createChartOverview)
-            this.props.createChartOverview(this, this.originalXScale, xSize, overviewYSize);
+            this.props.createChartOverview(this, this.originalXScale, xSize, overviewX_ySize);
     }
+
+    //<editor-fold desc="Brush in the main chart area (only when CTRL is held)">
+    keydownListener(event) {
+        if (event.key === "Control")
+            this.setBrushEnabled(true);
+    }
+    keyupListener(event) {
+        if (event.key === "Control" && !this.state.zoomInProgress)
+            this.setBrushEnabled(false);
+    }
+
+    setBrushEnabled(enabled) {
+        if (this.state.brushInProgress !== enabled)
+            this.setState({ brushInProgress: enabled });
+    }
+
+    /** Prepares the d3 brush for region selection.
+     *  Called from this.createChart(). */
+    createChartBrush(xSize, ySize) {
+        const self = this;
+
+        if (this.state.brushInProgress) {
+            const brush = d3Brush.brushX()
+                .extent([[0, 0], [xSize, ySize]])
+                .filter(() => {
+                    // noinspection JSUnresolvedVariable
+                    return !d3Event.button // enable brush when ctrl is pressed, modified version of default brush filter (https://github.com/d3/d3-brush#brush_filter)
+                })
+                .on("start", function () {
+                    self.setState({ zoomInProgress: true });
+                })
+                .on("end", function () {
+                    // noinspection JSUnresolvedVariable
+                    const sel = d3Event.selection;
+                    if (sel) {
+                        self.lastZoomCausedByUser = true;
+                        self.setZoomToPixels(sel[0], sel[1]);
+
+                        // hide brush
+                        self.brushSelection.call(brush.move, null);
+                        self.setState({
+                            brushInProgress: false,
+                            zoomInProgress: false
+                        });
+                    }
+                });
+
+            this.brushSelection
+                .attr('pointer-events', 'all')
+                .call(brush);
+        }
+        else {
+            this.brushParentSelection
+                .selectAll('rect')
+                .remove();
+            this.brushSelection
+                .attr('pointer-events', 'none');
+        }
+    }
+    //</editor-fold>
 
     render() {
         if (this.state.renderStatus === RenderStatus.NO_DATA) {
@@ -448,9 +535,14 @@ export class XZoomableChartBase extends Component {
                             <g ref={node => this.yAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
                             <text ref={node => this.yAxisLabelSelection = select(node)}
                                   transform={`translate(${15}, ${this.props.margin.top + (this.props.height - this.props.margin.top - this.props.margin.bottom) / 2}) rotate(-90)`} />
+
+                            <g ref={node => this.brushParentSelection = select(node)}
+                               transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} >
+                                <g ref={node => this.brushSelection = select(node)} />
+                            </g>
                         </svg>
                     </div>
-                    {this.props.withOverview &&
+                    {this.props.withOverviewX &&
                     <svg id="overview" height={this.props.overviewHeight}
                          width="100%">
                         {this.props.getOverviewSvgDefs(this)}
@@ -460,7 +552,7 @@ export class XZoomableChartBase extends Component {
                             </clipPath>
                         </defs>
                         <g transform={`translate(${this.props.margin.left}, ${this.props.overviewMargin.top})`} clipPath="url(#plotRect)" >
-                            {this.props.getOverviewContent(this, this.originalXScale, this.xSize, this.overviewYSize)}
+                            {this.props.getOverviewContent(this, this.originalXScale, this.xSize, this.overviewX_ySize)}
                         </g>
                         <g ref={node => this.overviewXAxisSelection = select(node)}
                            transform={`translate(${this.props.margin.left}, ${this.props.overviewHeight - this.props.overviewMargin.bottom})`}/>
