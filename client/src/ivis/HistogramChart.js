@@ -1,14 +1,12 @@
 'use strict';
 
 import React, {Component} from "react";
-import * as d3Axis from "d3-axis";
 import * as d3Scale from "d3-scale";
 import * as d3Format from "d3-format";
 import * as d3Selection from "d3-selection";
-import {event as d3Event, select} from "d3-selection";
+import {select} from "d3-selection";
 import * as d3Array from "d3-array";
 import * as d3Zoom from "d3-zoom";
-import * as d3Brush from "d3-brush";
 import * as d3Color from "d3-color";
 import {intervalAccessMixin} from "./TimeContext";
 import {DataAccessSession} from "./DataAccess";
@@ -18,9 +16,12 @@ import {withComponentMixins} from "../lib/decorator-helpers";
 import {withTranslation} from "../lib/i18n";
 import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
-import styles from "./CorrelationCharts.scss";
-import {brushHandlesLeftRight, isInExtent, transitionInterpolate, WheelDelta, ZoomEventSources} from "./common";
+import {
+    isInExtent,
+    RenderStatus,
+} from "./common";
 import {PropType_d3Color_Required, PropType_NumberInRange} from "../lib/CustomPropTypes";
+import {XZoomableChartBase} from "./XZoomableChartBase";
 
 const ConfigDifference = {
     NONE: 0,
@@ -54,7 +55,7 @@ class TooltipContent extends Component {
     };
 
     render() {
-        if (this.props.selection) {
+        if (this.props.signalSetsData && this.props.selection) {
             const step = this.props.signalSetsData.step;
             const bucket = this.props.selection;
 
@@ -91,18 +92,11 @@ export class HistogramChart extends Component {
             signalSetData: null,
             globalSignalSetData: null,
             statusMsg: t('Loading...'),
-            width: 0,
             maxBucketCount: 0,
-            zoomTransform: d3Zoom.zoomIdentity
         };
 
-        this.zoom = null;
-        this.brush = null;
-        this.lastZoomCausedByUser = false;
-
-        this.resizeListener = () => {
-            this.createChart(true);
-        };
+        this.xExtent = [0, 0];
+        this.yExtent = [0, 0];
     }
 
     static propTypes = {
@@ -172,8 +166,7 @@ export class HistogramChart extends Component {
     };
 
     componentDidMount() {
-        window.addEventListener('resize', this.resizeListener);
-        this.createChart(false, false);
+        this.base.createChart(false, false);
     }
 
     /** Update and redraw the chart based on changes in React props and state */
@@ -199,12 +192,11 @@ export class HistogramChart extends Component {
         if (!Object.is(prevProps.xMinValue, this.props.xMinValue) || !Object.is(prevProps.xMaxValue, this.props.xMaxValue))
             configDiff = Math.max(configDiff, ConfigDifference.DATA_WITH_CLEAR);
 
-        if (prevState.maxBucketCount !== this.state.maxBucketCount) {
+        if (prevState.maxBucketCount !== this.state.maxBucketCount)
             configDiff = Math.max(configDiff, ConfigDifference.DATA);
-        }
 
         if (configDiff === ConfigDifference.DATA_WITH_CLEAR) {
-            this.setZoom(d3Zoom.zoomIdentity); // reset zoom
+            this.base.resetZoom(true);
             this.setState({
                 statusMsg: t('Loading...')
             }, () => {
@@ -217,27 +209,16 @@ export class HistogramChart extends Component {
             this.fetchData();
         }
         else {
-             const forceRefresh = this.prevContainerNode !== this.containerNode
-                || prevState.signalSetData !== this.state.signalSetData
-                || configDiff !== ConfigDifference.NONE;
-
-            const updateZoom = !Object.is(prevState.zoomTransform, this.state.zoomTransform);
-
-            this.createChart(forceRefresh, updateZoom);
-            this.prevContainerNode = this.containerNode;
-            if (updateZoom)
-                this.callViewChangeCallback();
+            const forceRefresh = prevState.signalSetData !== this.state.signalSetData || configDiff !== ConfigDifference.NONE;
+            this.base.createChart(forceRefresh, false);
         }
-    }
-
-    componentWillUnmount() {
-        window.removeEventListener('resize', this.resizeListener);
     }
 
     /** Fetches new data for the chart, processes the results using prepareData method and updates the state accordingly, so the chart is redrawn */
     @withAsyncErrorHandler
     async fetchData() {
         const config = this.props.config;
+        const zoomTransform = this.base.getZoomTransform();
 
         let maxBucketCount = this.props.maxBucketCount || this.state.maxBucketCount;
         let minStep = this.props.minStep;
@@ -273,8 +254,8 @@ export class HistogramChart extends Component {
                     filter.children.push(this.props.filter);
 
                 // filter by current zoom
-                if (!Object.is(this.state.zoomTransform, d3Zoom.zoomIdentity)) {
-                    const scale = this.state.zoomTransform.k;
+                if (!Object.is(zoomTransform, d3Zoom.zoomIdentity)) {
+                    const scale = zoomTransform.k;
                     if (minStep !== undefined)
                         minStep = Math.floor(minStep / scale);
                     maxBucketCount = Math.ceil(maxBucketCount * scale);
@@ -297,8 +278,6 @@ export class HistogramChart extends Component {
                             signalSetData: null,
                             statusMsg: this.props.t("No data.")
                         });
-                        this.brush = null;
-                        this.zoom = null;
                         return;
                     }
                     if (isNaN(processedResults.step)) { // not a numeric signal
@@ -326,11 +305,11 @@ export class HistogramChart extends Component {
                     this.setState(newState, () => {
                         if (!isZoomedIn)
                             // call callViewChangeCallback when data new data without range filter are loaded as the xExtent might got updated (even though this.state.zoomTransform is the same)
-                            this.callViewChangeCallback();
+                            this.base.callViewChangeCallback();
                     });
                 }
             } catch (err) {
-                this.setState({statusMsg: this.props.t("Error loading data.")});
+                this.setState({statusMsg: this.props.t("Error loading data."), signalSetData: null});
                 throw err;
             }
         }
@@ -407,56 +386,34 @@ export class HistogramChart extends Component {
         };
     }
 
-    /** Creates (or updates) the chart with current data.
-     * This method is called from componentDidUpdate automatically when state or config is updated.
-     * All the 'createChart*' methods are called from here. */
-    createChart(forceRefresh, updateZoom) {
+    getXScale(range) {
+        return d3Scale.scaleLinear()
+            .domain(this.xExtent)
+            .range(range);
+    }
+
+    getYScale(range) {
+        return d3Scale.scaleLinear()
+            .domain(this.yExtent)
+            .range(range);
+    }
+
+    /** Computes the yExtent of the data filtered by the xScale updated by zoom. */
+    prepareChart(base, forceRefresh, updateZoom, xScale, xSize, ySize) {
+        const maxBucketCount = Math.ceil(xSize / this.props.minBarWidth);
+        if (this.state.maxBucketCount !== maxBucketCount)
+            this.setState({ maxBucketCount });
+
         /** @description last data loaded by fetchData */
         const signalSetData = this.state.signalSetData;
-        /** @description data loaded when chart was completely zoomed out - displayed by overview */
-        const globalSignalSetData = this.state.globalSignalSetData;
 
-        const width = this.containerNode.getClientRects()[0].width;
-
-        if (this.state.width !== width) {
-            const maxBucketCount = Math.ceil(width / this.props.minBarWidth);
-
-            this.setState({
-                width,
-                maxBucketCount
-            });
-        }
-
-        const widthChanged = width !== this.renderedWidth;
-        if (!forceRefresh && !widthChanged && !updateZoom) {
+        if (!signalSetData || !(forceRefresh || updateZoom))
             return;
-        }
-        this.renderedWidth = width;
-
-        if (!signalSetData || !globalSignalSetData) {
-            return;
-        }
-
-        //<editor-fold desc="Scales">
-        const ySize = this.props.height - this.props.margin.top - this.props.margin.bottom;
-        const xSize = this.renderedWidth - this.props.margin.left - this.props.margin.right;
-
-        let xScale = d3Scale.scaleLinear()
-            .domain(this.xExtent)
-            .range([0, width - this.props.margin.left - this.props.margin.right]);
-        xScale = this.state.zoomTransform.rescaleX(xScale);
-        this.xScale = xScale;
-        const xAxis = d3Axis.axisBottom(xScale)
-            .tickSizeOuter(0);
-        if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
-        if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
-        this.xAxisSelection.call(xAxis);
-        this.xAxisLabelSelection.text(this.props.xAxisLabel).style("text-anchor", "middle");
 
         let maxProb = signalSetData.maxProb;
         let maxProbInZoom;
         const [xDomainMin, xDomainMax] = xScale.domain();
-        if (this.state.zoomTransform.k > 1 && this.props.topPaddingWhenZoomed !== 1) {
+        if (base.getZoomTransform().k > 1 && this.props.topPaddingWhenZoomed !== 1) {
             maxProbInZoom = d3Array.max(signalSetData.buckets, b => {
                 if (b.key + signalSetData.step >= xDomainMin &&
                     b.key <= xDomainMax)
@@ -467,29 +424,29 @@ export class HistogramChart extends Component {
             if (maxProbInZoom / maxProb < 1 - this.props.topPaddingWhenZoomed)
                 maxProb = maxProbInZoom / (1 - this.props.topPaddingWhenZoomed);
         }
+        this.yExtent = [0, maxProb];
+    }
 
-        const yScale = d3Scale.scaleLinear()
-            .domain([0, maxProb])
-            .range([ySize, 0]);
-        const yAxis = d3Axis.axisLeft(yScale)
-            .tickFormat(yScale.tickFormat(10, "-%"));
-        (this.props.withTransition ? this.yAxisSelection.transition() : this.yAxisSelection)
-            .call(yAxis);
-        //</editor-fold>
+    /** Creates (or updates) the chart with current data. This method is called from the XZoomableChartBase base class (from createChart method, which is called from this.componentDidUpdate)
+     */
+    createChart(base, forceRefresh, updateZoom, xScale, yScale, xSize, ySize) {
+        /** @description last data loaded by fetchData */
+        const signalSetData = this.state.signalSetData;
+
+        if (!signalSetData)
+            return RenderStatus.NO_DATA;
+        if (!forceRefresh && !updateZoom)
+            return RenderStatus.SUCCESS;
 
         this.drawBars(signalSetData, this.barsSelection, xScale, yScale, d3Color.color(this.props.config.color), false);
 
-        // we don't want to change zoom object and cursor area when updating only zoom (it breaks touch drag)
-        if (forceRefresh || widthChanged) {
-            this.createChartCursorArea();
-            if (this.props.withZoom)
-                this.createChartZoom(xSize, ySize);
-        }
+        // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
+        if (forceRefresh)
+            this.createChartCursorArea(xSize, ySize);
 
-        this.createChartCursor(signalSetData, xScale, yScale, ySize);
+        this.createChartCursor(signalSetData, xScale, yScale, xSize, ySize);
 
-        if (this.props.withOverview)
-            this.createChartOverview(globalSignalSetData);
+        return RenderStatus.SUCCESS;
     }
 
     // noinspection JSCommentMatchesSignature
@@ -524,9 +481,9 @@ export class HistogramChart extends Component {
             .remove();
     }
 
-    /** Prepares rectangle for cursor movement events.
+    /** Prepares the rectangle for cursor movement events.
      *  Called from this.createChart(). */
-    createChartCursorArea() {
+    createChartCursorArea(xSize, ySize) {
         this.cursorAreaSelection
             .selectAll('rect')
             .remove();
@@ -537,14 +494,14 @@ export class HistogramChart extends Component {
             .attr('cursor', 'crosshair')
             .attr('x', 0)
             .attr('y', 0)
-            .attr('width', this.renderedWidth - this.props.margin.left - this.props.margin.right)
-            .attr('height', this.props.height - this.props.margin.top - this.props.margin.bottom)
+            .attr('width', xSize)
+            .attr('height', ySize)
             .attr('visibility', 'hidden');
     }
 
     /** Handles mouse movement to select the closest bar (for displaying its details in Tooltip, etc.).
      *  Called from this.createChart(). */
-    createChartCursor(signalSetData, xScale, yScale) {
+    createChartCursor(signalSetData, xScale, yScale, xSize, ySize) {
         const self = this;
         const highlightBarColor = d3Color.color(this.props.config.color).darker();
 
@@ -558,8 +515,8 @@ export class HistogramChart extends Component {
             if (self.state.zoomInProgress)
                 return;
 
-            const containerPos = d3Selection.mouse(self.containerNode);
-            const x = containerPos[0] - self.props.margin.left;
+            const containerPos = d3Selection.mouse(self.cursorAreaSelection.node());
+            const x = containerPos[0];
 
             const key = xScale.invert(x);
             let newSelection = null;
@@ -584,8 +541,8 @@ export class HistogramChart extends Component {
             }
 
             self.cursorSelection
-                .attr('y1', self.props.margin.top)
-                .attr('y2', self.props.height - self.props.margin.bottom)
+                .attr('y1', 0)
+                .attr('y2', ySize)
                 .attr('x1', containerPos[0])
                 .attr('x2', containerPos[0])
                 .attr('visibility', self.props.withCursor ? 'visible' : "hidden");
@@ -605,6 +562,7 @@ export class HistogramChart extends Component {
             .on('mouseleave', ::this.deselectPoints);
     }
 
+    /** Called when mouse leaves the chart. Hides the Tooltip, etc. */
     deselectPoints() {
         this.cursorSelection.attr('visibility', 'hidden');
 
@@ -618,68 +576,11 @@ export class HistogramChart extends Component {
         });
     }
 
-    /** Handles zoom of the chart by user using d3-zoom.
-     *  Called from this.createChart(). */
-    createChartZoom(xSize, ySize) {
-        // noinspection DuplicatedCode
-        const self = this;
-
-        const handleZoom = function () {
-            // noinspection JSUnresolvedVariable
-            if (self.props.withTransition && d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel") {
-                self.lastZoomCausedByUser = true;
-                transitionInterpolate(select(self), self.state.zoomTransform, d3Event.transform, setZoomTransform, () => {
-                    self.deselectPoints();
-                });
-            } else {
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                    self.lastZoomCausedByUser = true;
-                // noinspection JSUnresolvedVariable
-                setZoomTransform(d3Event.transform);
-            }
-        };
-
-        const setZoomTransform = function (transform) {
-            self.setState({
-                zoomTransform: transform
-            });
-            self.moveBrush(transform);
-        };
-
-        const handleZoomEnd = function () {
-            self.deselectPoints();
-            self.setState({
-                zoomInProgress: false
-            });
-        };
-        const handleZoomStart = function () {
-            self.setState({
-                zoomInProgress: true
-            });
-        };
-
-        const zoomExtent = [[0,0], [xSize, ySize]];
-        const zoomExisted = this.zoom !== null;
-        this.zoom = zoomExisted ? this.zoom : d3Zoom.zoom();
-        this.zoom
-            .scaleExtent([this.props.zoomLevelMin, this.props.zoomLevelMax])
-            .translateExtent(zoomExtent)
-            .extent(zoomExtent)
-            .on("zoom", handleZoom)
-            .on("end", handleZoomEnd)
-            .on("start", handleZoomStart)
-            .wheelDelta(WheelDelta(2));
-        this.svgContainerSelection.call(this.zoom);
-        this.moveBrush(this.state.zoomTransform);
-    }
-
     /** Returns the current view (boundaries of visible region)
      * @return {{xMin: number, xMax: number }} left, right boundary
      */
     getView() {
-        const [xMin, xMax] = this.xScale.domain();
-        return {xMin, xMax};
+        return this.base.getView();
     }
 
     /**
@@ -692,193 +593,89 @@ export class HistogramChart extends Component {
     setView(xMin, xMax, source, causedByUser = false) {
         if (source === this || this.state.signalSetData === null)
             return;
-
-        if (xMin === undefined) xMin = this.xScale.domain()[0];
-        if (xMax === undefined) xMax = this.xScale.domain()[1];
-
-        if (isNaN(xMin) || isNaN(xMax))
-            throw new Error("Parameters must be numbers.");
-
-        this.lastZoomCausedByUser = causedByUser;
-        // noinspection JSUnresolvedVariable
-        this.setZoomToLimits(xMin, xMax);
+        if (this.base)
+            this.base.setView(xMin, xMax, source, causedByUser);
     }
 
-    /** Sets zoom object (transform) to desired view boundaries. */
-    setZoomToLimits(xMin, xMax) {
-        if (this.brush) {
-            this.overviewBrushSelection.call(this.brush.move, [this.overviewXScale(xMin), this.overviewXScale(xMax)]);
-            // brush will also adjust zoom if sourceEvent is not "zoom" caused by this.zoom which is true when this method is called from this.setView
-        }
-        else {
-            const newXSize = xMax - xMin;
-            const oldXSize = this.xScale.domain()[1] - this.xScale.domain()[0];
-
-            const leftInverted = this.state.zoomTransform.invertX(this.xScale(xMin));
-            const transform = d3Zoom.zoomIdentity.scale(this.state.zoomTransform.k * oldXSize / newXSize).translate(-leftInverted, 0);
-
-            this.setZoom(transform);
-        }
-    }
-
-    /** Helper method to update zoom transform in state and zoom object. */
-    setZoom(transform) {
-        if (this.zoom)
-            this.svgContainerSelection.call(this.zoom.transform, transform);
-        else {
-            this.setState({zoomTransform: transform});
-            this.moveBrush(transform);
-        }
-    }
-
-    /** Updates overview brushes from zoom transform. */
-    moveBrush(transform) {
-        if (this.brush)
-            this.overviewBrushSelection.call(this.brush.move, this.defaultBrush.map(transform.invertX, transform));
-    };
-
-    callViewChangeCallback() {
-        if (typeof(this.props.viewChangeCallback) !== "function")
-            return;
-
-        this.props.viewChangeCallback(this, this.getView(), this.lastZoomCausedByUser);
-    }
-
-    /** Creates additional histogram below the main one without zoom to enable zoom navigation by d3-brush
-     *  Called from this.createChart(). */
-    createChartOverview(signalSetData) {
-        //<editor-fold desc="Scales">
-        const ySize = this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom;
+    /** Draws an additional histogram to the overview (see XZoomableChartBase.createChartOverview) below the main chart
+     *  Called from XZoomableChartBase.createChart(). */
+    createChartOverview(base, xScale, xSize, ySize) {
+        /** @description data loaded when chart was completely zoomed out - displayed by overview */
+        const globalSignalSetData = this.state.globalSignalSetData;
+        if (!globalSignalSetData) return;
 
         const yScale = d3Scale.scaleLinear()
-            .domain([0, signalSetData.maxProb])
+            .domain([0, globalSignalSetData.maxProb])
             .range([ySize, 0]);
 
-        let xScale = d3Scale.scaleLinear()
-            .domain(this.xExtent)
-            .range([0, this.renderedWidth - this.props.margin.left - this.props.margin.right]);
-        this.overviewXScale = xScale;
-        const xAxis = d3Axis.axisBottom(xScale)
-            .tickSizeOuter(0);
-        if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
-        if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
-        this.overviewXAxisSelection.call(xAxis);
-        //</editor-fold>
-
-        this.drawBars(signalSetData, this.overviewBarsSelection, xScale, yScale, d3Color.color(this.props.config.color));
-
-        this.createChartOverviewBrush();
+        this.drawBars(globalSignalSetData, this.overviewBarsSelection, xScale, yScale, d3Color.color(this.props.config.color));
     }
 
-    /** Creates d3-brush for overview.
-     *  Called from this.createChart(). */
-    createChartOverviewBrush() {
-        const self = this;
+    getGraphContent(base, xScale, yScale, xSize, ySize) {
+        return (<>
+            <g ref={node => this.barsSelection = select(node)}/>
+            <g ref={node => this.barsHighlightSelection = select(node)}/>
 
-        const xSize = this.renderedWidth - this.props.margin.left - this.props.margin.right;
-        const ySize = this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom;
-        this.defaultBrush = [0, xSize];
-        const brushExisted = this.brush !== null;
-        this.brush = brushExisted ? this.brush :d3Brush.brushX();
-        this.brush
-            .extent([[0, 0], [xSize, ySize]])
-            .handleSize(20)
-            .on("brush", function () {
-                // noinspection JSUnresolvedVariable
-                const sel = d3Event.selection;
-                self.overviewBrushSelection.call(brushHandlesLeftRight, sel, ySize);
+            {!base.state.zoomInProgress &&
+            <line ref={node => this.cursorSelection = select(node)} strokeWidth="1" stroke="rgb(50,50,50)" visibility="hidden"/>}
+            <text textAnchor="middle" x="50%" y="50%" fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
+                {this.state.statusMsg}
+            </text>
 
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "zoom" && d3Event.sourceEvent.target === self.zoom) return; // ignore brush-by-zoom
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && d3Event.sourceEvent.target === self.brush) return; // ignore brush by itself
+            {this.props.withTooltip && !base.state.zoomInProgress &&
+            <Tooltip
+                config={this.props.config}
+                signalSetsData={this.state.signalSetData}
+                containerHeight={ySize}
+                containerWidth={xSize}
+                mousePosition={this.state.mousePosition}
+                selection={this.state.selection}
+                contentRender={props => <TooltipContent {...props} tooltipFormat={this.props.tooltipFormat} />}
+            />}
+            <g ref={node => this.cursorAreaSelection = select(node)} />
+        </>);
+    }
 
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                    self.lastZoomCausedByUser = true;
-
-                const newTransform = d3Zoom.zoomIdentity.scale(xSize / (sel[1] - sel[0])).translate(-sel[0], 0);
-                self.setZoom(newTransform);
-            });
-
-        this.overviewBrushSelection
-            .attr('pointer-events', 'all')
-            .call(this.brush);
-        if (!brushExisted)
-            this.overviewBrushSelection.call(this.brush.move, this.defaultBrush);
-        this.overviewBrushSelection.select(".selection")
-            .classed(styles.selection, true);
-        this.overviewBrushSelection.select(".overlay")
-            .attr('pointer-events', 'none');
+    getOverviewContent() {
+        return (
+            <g ref={node => this.overviewBarsSelection = select(node)}/>
+        );
     }
 
     render() {
-        if (!this.state.signalSetData) {
-            return (
-                <svg ref={node => this.containerNode = node} height={this.props.height} width="100%"
-                     className={this.props.className} style={this.props.style} >
-                    <text textAnchor="middle" x="50%" y="50%" fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                        {this.state.statusMsg}
-                    </text>
-                </svg>
-            );
+        return (
+            <XZoomableChartBase
+                ref={node => this.base = node}
 
-        } else {
+                height={this.props.height}
+                margin={this.props.margin}
+                withOverview={this.props.withOverview}
+                overviewHeight={this.props.overviewHeight}
+                overviewMargin={this.props.overviewMargin}
+                withTransition={this.props.withTransition}
+                withZoom={this.props.withZoom}
 
-            return (
-                <div className={this.props.className} style={this.props.style} >
-                    <div ref={node => this.svgContainerSelection = select(node)} className={styles.touchActionPanY}>
-                    <svg id="cnt" ref={node => this.containerNode = node} height={this.props.height} width="100%">
-                        <defs>
-                            <clipPath id="plotRect">
-                                <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.height - this.props.margin.top - this.props.margin.bottom} />
-                            </clipPath>
-                        </defs>
-                        <g transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" >
-                            <g ref={node => this.barsSelection = select(node)}/>
-                            <g ref={node => this.barsHighlightSelection = select(node)}/>
-                        </g>
+                getXScale={::this.getXScale}
+                getYScale={::this.getYScale}
+                statusMsg={this.state.statusMsg}
 
-                        {/* axes */}
-                        <g ref={node => this.xAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.height - this.props.margin.bottom})`}/>
-                        <text ref={node => this.xAxisLabelSelection = select(node)}
-                              transform={`translate(${this.props.margin.left + (this.state.width - this.props.margin.left - this.props.margin.right) / 2}, ${this.props.height - 5})`} />
-                        <g ref={node => this.yAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
+                createChart={::this.createChart}
+                createChartOverview={::this.createChartOverview}
+                prepareChart={::this.prepareChart}
+                getGraphContent={::this.getGraphContent}
+                getOverviewContent={::this.getOverviewContent}
+                onZoomEnd={::this.deselectPoints}
 
-                        {!this.state.zoomInProgress &&
-                        <line ref={node => this.cursorSelection = select(node)} strokeWidth="1" stroke="rgb(50,50,50)" visibility="hidden"/>}
-                        <text textAnchor="middle" x="50%" y="50%" fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                            {this.state.statusMsg}
-                        </text>
-                        {this.props.withTooltip && !this.state.zoomInProgress &&
-                        <Tooltip
-                            config={this.props.config}
-                            signalSetsData={this.state.signalSetData}
-                            containerHeight={this.props.height}
-                            containerWidth={this.state.width}
-                            mousePosition={this.state.mousePosition}
-                            selection={this.state.selection}
-                            contentRender={props => <TooltipContent {...props} tooltipFormat={this.props.tooltipFormat} />}
-                        />
-                        }
-                        <g ref={node => this.cursorAreaSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
-                    </svg>
-                    </div>
-                    {this.props.withOverview &&
-                    <svg id="overview" height={this.props.overviewHeight}
-                         width="100%">
-                        <g transform={`translate(${this.props.margin.left}, ${this.props.overviewMargin.top})`}>
-                            <g ref={node => this.overviewBarsSelection = select(node)}/>
-                        </g>
-                        <g ref={node => this.overviewXAxisSelection = select(node)}
-                           transform={`translate(${this.props.margin.left}, ${this.props.overviewHeight - this.props.overviewMargin.bottom})`}/>
-                        <g ref={node => this.overviewBrushSelection = select(node)}
-                           transform={`translate(${this.props.margin.left}, ${this.props.overviewMargin.top})`}
-                           className={styles.brush}/>
-                    </svg>}
-                </div>
-
-            );
-        }
+                yAxisTicksFormat={this.getYScale([0,0]).tickFormat(10, "-%")}
+                xAxisTicksCount={this.props.xAxisTicksCount}
+                xAxisTicksFormat={this.props.xAxisTicksFormat}
+                xAxisLabel={this.props.xAxisLabel}
+                viewChangeCallback={this.props.viewChangeCallback}
+                zoomLevelMin={this.props.zoomLevelMin}
+                zoomLevelMax={this.props.zoomLevelMax}
+                className={this.props.className}
+                style={this.props.style}
+            />
+        );
     }
 }

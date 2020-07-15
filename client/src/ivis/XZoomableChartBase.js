@@ -2,37 +2,29 @@
 
 import React, {Component} from "react";
 import * as d3Axis from "d3-axis";
-import * as d3Scale from "d3-scale";
-import * as d3Format from "d3-format";
-import * as d3Selection from "d3-selection";
 import {event as d3Event, select} from "d3-selection";
-import * as d3Array from "d3-array";
 import * as d3Zoom from "d3-zoom";
 import * as d3Brush from "d3-brush";
-import * as d3Color from "d3-color";
-import {intervalAccessMixin} from "./TimeContext";
-import {DataAccessSession} from "./DataAccess";
-import {withAsyncErrorHandler, withErrorHandling} from "../lib/error-handling";
+import {withErrorHandling} from "../lib/error-handling";
 import PropTypes from "prop-types";
 import {withComponentMixins} from "../lib/decorator-helpers";
 import {withTranslation} from "../lib/i18n";
-import {Tooltip} from "./Tooltip";
-import {Icon} from "../lib/bootstrap-components";
 import styles from "./CorrelationCharts.scss";
 import {
     brushHandlesLeftRight,
-    isInExtent,
     RenderStatus,
     transitionInterpolate,
     WheelDelta,
     ZoomEventSources
 } from "./common";
-import {PropType_d3Color_Required, PropType_NumberInRange} from "../lib/CustomPropTypes";
 
+/**
+ * Base class for charts with horizontal zoom.
+ */
 @withComponentMixins([
     withTranslation,
     withErrorHandling
-], ["getView", "setView"])
+], ["getView", "setView", "getZoomTransform", "resetZoom", "createChart", "callViewChangeCallback"])
 export class XZoomableChartBase extends Component {
     constructor(props){
         super(props);
@@ -43,6 +35,9 @@ export class XZoomableChartBase extends Component {
             zoomTransform: d3Zoom.zoomIdentity,
             width: 0
         };
+
+        this.xSize = 0;
+        this.ySize = 0;
 
         this.zoom = null;
         this.brush = null;
@@ -66,12 +61,19 @@ export class XZoomableChartBase extends Component {
 
         getXScale: PropTypes.func.isRequired,
         getYScale: PropTypes.func, // can be called repeatedly
+        statusMsg: PropTypes.string,
 
         createChart: PropTypes.func.isRequired, // createChart(base, forceRefresh, updateZoom, updated_xScale, yScale, xSize, ySize)
+        createChartOverview: PropTypes.func, // createChartOverview(base, original_xScale, xSize, overview_ySize)
+        prepareChart: PropTypes.func, // prepareChart(base, forceRefresh, updateZoom, updated_xScale, xSize, ySize) - called before the props.createChart so that the data can be filtered and the yScale in the createChart method call corresponds to the filtered data
         getGraphContent: PropTypes.func.isRequired, // getGraphContent(base, updated_xScale, yScale, xSize, ySize)
-        getOverviewContent: PropTypes.func, // getOverviewContent(base, original_xScale, xSize, ySize)
+        getOverviewContent: PropTypes.func, // getOverviewContent(base, original_xScale, xSize, overview_ySize)
         getSvgDefs: PropTypes.func, // getSvgDefs(base, xScale, yScale, xSize, ySize)
-        getOverviewSvgDefs: PropTypes.func, // getOverviewSvgDefs(base, original_xScale, xSize, ySize)
+        getOverviewSvgDefs: PropTypes.func, // getOverviewSvgDefs(base, original_xScale, xSize, overview_ySize)
+
+        onZoomStart: PropTypes.func,
+        onZoom: PropTypes.func,
+        onZoomEnd: PropTypes.func,
 
         xAxisTicksCount: PropTypes.number,
         xAxisTicksFormat: PropTypes.func,
@@ -108,6 +110,7 @@ export class XZoomableChartBase extends Component {
         getSvgDefs: () => null,
         getOverviewSvgDefs: () => null,
         getYScale: () => null,
+        statusMsg: "",
     };
 
     componentDidMount() {
@@ -131,8 +134,10 @@ export class XZoomableChartBase extends Component {
     }
 
     /** Creates (or updates) the chart with current data.
-     * This method is called from componentDidUpdate automatically when state or config is updated.
-     * All the 'createChart*' methods are called from here. */
+     * This method is called from componentDidUpdate automatically when state or config is updated or can be called from outside (from the component which is built on this base class).
+     * It first computes the size of the chart and then calls the prepareChart and createChart methods from props with xScale updated by the zoom.
+     * - The prepareChart method can be used to update the data according to the new xScale, so that the yScale used in the createChart method corresponds to the new data. See HistogramChart as an example.
+     **/
     createChart(forceRefresh, updateZoom) {
         const width = this.containerNode.getClientRects()[0].width;
         const widthChanged = width !== this.state.width;
@@ -149,28 +154,35 @@ export class XZoomableChartBase extends Component {
         this.originalXScale = xScale;
         xScale = this.state.zoomTransform.rescaleX(xScale);
         this.xScale = xScale;
+
+        // prepare the data in the child - update it according to the new xScale
+        if (this.props.prepareChart)
+            this.props.prepareChart(this, forceRefresh || widthChanged, updateZoom, xScale, xSize, ySize);
+
         // get yScale
-        const yScale = this.props.getYScale(/* range: */ [ySize, 0]);
+        const yScale = this.props.getYScale(/* range: */ [this.ySize, 0]);
         this.yScale = yScale;
 
-        // we don't want to change zoom object and cursor area when updating only zoom (it breaks touch drag)
+        // everything is prepared, now call the createChart method of the child
+        const renderStatus = this.props.createChart(this, forceRefresh || widthChanged, updateZoom, xScale, yScale, xSize, ySize);
+        if (renderStatus !== this.state.renderStatus)
+            this.setState({renderStatus});
+        if (renderStatus === RenderStatus.NO_DATA)
+            return;
+
+        // draw the axes - update the yScale before drawing it - it might have changed in this.props.createChart
+        this.drawXAxis();
+        this.drawYAxis();
+
+        // and the rest of the chart
+        if (this.props.withOverview) {
+            this.createChartOverview(xSize);
+        }
+        // we don't want to change zoom object when updating only zoom (it breaks touch drag)
         if (forceRefresh || widthChanged) {
             if (this.props.withZoom)
                 this.createChartZoom(xSize, ySize);
         }
-
-        // everything is prepared, now call the createChart method of the child
-        const renderStatus = this.props.createChart(this, forceRefresh, updateZoom, xScale, yScale, xSize, ySize);
-        if (renderStatus !== this.state.renderStatus)
-            this.setState({renderStatus});
-
-        // draw the axes - update the yScale before drawing it - it might have changed in this.props.createChart
-        this.drawXAxis();
-        this.drawYAxis(ySize);
-
-        // and the rest of the chart
-        if (this.props.withOverview)
-            this.createChartOverview(xSize);
     }
 
     drawXAxis() {
@@ -182,11 +194,8 @@ export class XZoomableChartBase extends Component {
         this.xAxisLabelSelection.text(this.props.xAxisLabel).style("text-anchor", "middle");
     }
 
-    drawYAxis(ySize) {
-        // get yScale again - it might have changed in this.props.createChart
-        const yScale = this.props.getYScale(/* range: */ [ySize, 0]);
-        this.yScale = yScale;
-        if (yScale === null || yScale === undefined) return;
+    drawYAxis() {
+        if (this.yScale === null || this.yScale === undefined) return;
         const yAxis = d3Axis.axisLeft(this.yScale);
         if (this.props.yAxisTicksCount) yAxis.ticks(this.props.yAxisTicksCount);
         if (this.props.yAxisTicksFormat) yAxis.tickFormat(this.props.yAxisTicksFormat);
@@ -205,7 +214,7 @@ export class XZoomableChartBase extends Component {
             if (self.props.withTransition && d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel") {
                 self.lastZoomCausedByUser = true;
                 transitionInterpolate(select(self), self.state.zoomTransform, d3Event.transform, setZoomTransform, () => {
-                    self.deselectPoints();
+                    if (typeof self.props.onZoomEnd === 'function') self.props.onZoomEnd();
                 });
             } else {
                 // noinspection JSUnresolvedVariable
@@ -221,17 +230,20 @@ export class XZoomableChartBase extends Component {
                 zoomTransform: transform
             });
             self.moveBrush(transform);
+            if (typeof self.props.onZoom === 'function') self.props.onZoom(d3Event, transform);
         };
 
         const handleZoomEnd = function () {
             self.setState({
                 zoomInProgress: false
             });
+            if (typeof self.props.onZoomEnd === 'function') self.props.onZoomEnd(d3Event);
         };
         const handleZoomStart = function () {
             self.setState({
                 zoomInProgress: true
             });
+            if (typeof self.props.onZoomStart === 'function') self.props.onZoomStart(d3Event);
         };
 
         const zoomExtent = [[0,0], [xSize, ySize]];
@@ -247,6 +259,11 @@ export class XZoomableChartBase extends Component {
             .wheelDelta(WheelDelta(this.props.zoomLevelWheelDelta));
         this.svgContainerSelection.call(this.zoom);
         this.moveBrush(this.state.zoomTransform);
+    }
+
+    /** Returns the current zoomTransform (https://github.com/d3/d3-zoom#zoom-transforms) */
+    getZoomTransform() {
+        return this.state.zoomTransform;
     }
 
     /** Returns the current view (boundaries of visible region)
@@ -275,14 +292,13 @@ export class XZoomableChartBase extends Component {
             throw new Error("Parameters must be numbers.");
 
         this.lastZoomCausedByUser = causedByUser;
-        // noinspection JSUnresolvedVariable
         this.setZoomToLimits(xMin, xMax);
     }
 
     /** Sets zoom object (transform) to desired view boundaries. */
     setZoomToLimits(xMin, xMax) {
         if (this.brush) {
-            this.overviewBrushSelection.call(this.brush.move, [this.overviewXScale(xMin), this.overviewXScale(xMax)]);
+            this.overviewBrushSelection.call(this.brush.move, [this.originalXScale(xMin), this.originalXScale(xMax)]);
             // brush will also adjust zoom if sourceEvent is not "zoom" caused by this.zoom which is true when this method is called from this.setView
         }
         else {
@@ -294,6 +310,15 @@ export class XZoomableChartBase extends Component {
 
             this.setZoom(transform);
         }
+    }
+
+    /**
+     * Resets the visible region of the chart to the initial
+     * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
+     */
+    resetZoom(causedByUser = false) {
+        this.lastZoomCausedByUser = causedByUser;
+        this.setZoom(d3Zoom.zoomIdentity);
     }
 
     /** Helper method to update zoom transform in state and zoom object. */
@@ -312,6 +337,9 @@ export class XZoomableChartBase extends Component {
             this.overviewBrushSelection.call(this.brush.move, this.defaultBrush.map(transform.invertX, transform));
     };
 
+    /**
+     * Calls the props.viewChangeCallback method
+     */
     callViewChangeCallback() {
         if (typeof(this.props.viewChangeCallback) !== "function")
             return;
@@ -369,6 +397,10 @@ export class XZoomableChartBase extends Component {
             .classed(styles.selection, true);
         this.overviewBrushSelection.select(".overlay")
             .attr('pointer-events', 'none');
+
+        // call createChartOverview method in child to update the overview
+        if (this.props.createChartOverview)
+            this.props.createChartOverview(this, this.originalXScale, xSize, overviewYSize);
     }
 
     render() {
@@ -377,8 +409,7 @@ export class XZoomableChartBase extends Component {
                 <svg ref={node => this.containerNode = node} height={this.props.height} width="100%"
                      className={this.props.className} style={this.props.style} >
                     <text textAnchor="middle" x="50%" y="50%" fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                        {this.props.t('No data.') // TODO handle different messages
-                        }
+                        {this.props.statusMsg}
                     </text>
                 </svg>
             );
@@ -412,7 +443,7 @@ export class XZoomableChartBase extends Component {
                         {this.props.getOverviewSvgDefs(this)}
                         <defs>
                             <clipPath id="overviewRect">
-                                <rect x="0" y="0" width={this.state.width - this.props.overviewMargin.left - this.props.overviewMargin.right} height={this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom} />
+                                <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.overviewHeight - this.props.overviewMargin.top - this.props.overviewMargin.bottom} />
                             </clipPath>
                         </defs>
                         <g transform={`translate(${this.props.margin.left}, ${this.props.overviewMargin.top})`} clipPath="url(#plotRect)" >
