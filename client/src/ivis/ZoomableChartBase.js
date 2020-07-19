@@ -3,6 +3,7 @@
 import React, {Component} from "react";
 import * as d3Axis from "d3-axis";
 import {event as d3Event, select} from "d3-selection";
+import * as d3Selection from "d3-selection";
 import * as d3Zoom from "d3-zoom";
 import * as d3Brush from "d3-brush";
 import * as d3Interpolate from "d3-interpolate";
@@ -12,13 +13,14 @@ import {withComponentMixins} from "../lib/decorator-helpers";
 import {withTranslation} from "../lib/i18n";
 import styles from "./CorrelationCharts.scss";
 import {
+    AreZoomTransformsEqual,
     brushHandlesLeftRight, brushHandlesTopBottom,
-    RenderStatus,
+    RenderStatus, setZoomTransform, transitionInterpolate, WheelDelta,
     ZoomEventSources
 } from "./common";
 
 /**
- * Base class for charts with horizontal zoom.
+ * Base class for charts with zoom.
  */
 @withComponentMixins([
     withTranslation,
@@ -29,8 +31,8 @@ export class ZoomableChartBase extends Component {
         super(props);
 
         this.state = {
-            viewX: [0, 0],
-            viewY: [0, 0],
+            zoomTransform: d3Zoom.zoomIdentity,
+            zoomYScaleMultiplier: 1,
             width: 0,
             brushInProgress: false,
         };
@@ -45,6 +47,7 @@ export class ZoomableChartBase extends Component {
         this.brushY = null;
 
         this.lastZoomCausedByUser = false;
+        this.ignoreZoomEvents = false;
 
         this.resizeListener = () => {
             this.createChart(true);
@@ -81,6 +84,7 @@ export class ZoomableChartBase extends Component {
         getOverviewContent: PropTypes.func, // getOverviewContent(base, original_xScale, xSize, overview_ySize)
         getSvgDefs: PropTypes.func, // getSvgDefs(base, xScale, yScale, xSize, ySize)
         getOverviewSvgDefs: PropTypes.func, // getOverviewSvgDefs(base, original_xScale, xSize, overview_ySize)
+        rerenderAfterCreateChart: PropTypes.bool, // if getGraphContent is used to draw the chart, set this to true to force rendering after the scales are updated - by default, React first calls render (which calls getGraphContent) and then componentDidUpdate (which calls createChart); setting this to true will force React to call render again after createChart; if the chart is drawn in createChart, keep this to false
 
         onZoomStart: PropTypes.func,
         onZoom: PropTypes.func,
@@ -114,9 +118,10 @@ export class ZoomableChartBase extends Component {
         withZoomX: true,
         withZoomY: true,
         withBrush: true,
+        rerenderAfterCreateChart: false,
 
         zoomLevelMin: 1,
-        zoomLevelMax: 4,
+        zoomLevelMax: Number.POSITIVE_INFINITY,
         zoomLevelWheelDelta: 2,
 
         overviewXHeight: 50,
@@ -143,7 +148,8 @@ export class ZoomableChartBase extends Component {
         const forceRefresh =
             this.prevContainerNode !== this.containerNode ||
             prevState.brushInProgress !== this.state.brushInProgress;
-        const updateZoom = !Object.is(prevState.viewX, this.state.viewX) || !Object.is(prevState.viewY, this.state.viewY);
+        const updateZoom = !AreZoomTransformsEqual(prevState.zoomTransform, this.state.zoomTransform)
+            || prevState.zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier;
 
         this.createChart(forceRefresh, updateZoom);
         this.prevContainerNode = this.containerNode;
@@ -172,6 +178,9 @@ export class ZoomableChartBase extends Component {
         this.ySize = ySize;
         const xSize = width - this.props.margin.left - this.props.margin.right;
         this.xSize = xSize;
+
+        this.defaultBrushX = [0, xSize];
+        this.defaultBrushY = [0, ySize];
 
         // update xScale with zoom, draw it later; sets this.xScale
         this.updateXScale(xSize);
@@ -204,13 +213,17 @@ export class ZoomableChartBase extends Component {
         if (this.props.withOverviewY)
             this.createChartOverviewY(ySize);
 
-        // we don't want to change zoom object when updating only zoom (it breaks touch drag)
-        //if ((forceRefresh || widthChanged) && (this.props.withZoomX || this.props.withZoomY))
-        //    this.createChartZoom(xSize, ySize);
+        if (this.props.withZoomX || this.props.withZoomY)
+            this.createChartZoom(xSize, ySize);
         if (this.props.withBrush)
             this.createChartBrush(xSize, ySize);
+
+        if (this.props.rerenderAfterCreateChart && (forceRefresh || updateZoom))
+            // force rerender
+            this.setState({});
     }
 
+    //<editor-fold desc="Scales and axes">
     updateXScale(xSize) {
         let xScale = this.props.getXScale(/* range: */ [0, xSize]);
         this.originalXScale = xScale;
@@ -233,8 +246,7 @@ export class ZoomableChartBase extends Component {
 
     drawXAxis() {
         if (this.xScale === null || this.xScale === undefined) return;
-        const xAxis = d3Axis.axisBottom(this.xScale)
-            .tickSizeOuter(0);
+        const xAxis = d3Axis.axisBottom(this.xScale);
         if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
         if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
         this.xAxisSelection.call(xAxis);
@@ -249,19 +261,90 @@ export class ZoomableChartBase extends Component {
         this.yAxisSelection.call(yAxis);
         this.yAxisLabelSelection.text(this.props.yAxisLabel).style("text-anchor", "middle");
     }
+    //</editor-fold>
 
     /** Returns the current zoomTransform for x-axis (https://github.com/d3/d3-zoom#zoom-transforms) */
     getXZoomTransform() {
-        const newSize = this.state.viewX[1] - this.state.viewX[0];
-        return d3Zoom.zoomIdentity.scale(this.xSize / newSize).translate(-this.state.viewX[0], 0);
+        return this.state.zoomTransform;
     }
 
     /** Returns the current zoomTransform for y-axis (https://github.com/d3/d3-zoom#zoom-transforms) */
     getYZoomTransform() {
-        const newSize = this.state.viewY[1] - this.state.viewY[0];
-        return d3Zoom.zoomIdentity.scale(this.ySize / newSize).translate(0, -this.state.viewY[0]);
+        return this.state.zoomTransform.scale(this.state.zoomYScaleMultiplier);
     }
 
+    //<editor-fold desc="Public methods">
+    /** Returns the current view (boundaries of visible region)
+     * @return {{xMin, xMax, yMin, yMax }} left, right, bottom, top boundary (numbers or strings based on the type of data on each axis)
+     */
+    getView() {
+        const [xMin, xMax] = this.xScale.domain(); // TODO band scale
+        const [yMin, yMax] = this.yScale.domain();
+        return {xMin, xMax, yMin, yMax};
+    }
+
+    /**
+     * Set the visible region of the chart to defined limits (in units of the data, not in pixels). If the axis data type is keyword (string), both boundary values are included.
+     * @param xMin          left boundary of the visible region (in units of data on x-axis)
+     * @param xMax          right boundary of the visible region (in units of data on x-axis)
+     * @param yMin          bottom boundary of the visible region (in units of data on x-axis)
+     * @param yMax          top boundary of the visible region (in units of data on x-axis)
+     * @param source        the element which caused the view change (if source === this, the update is ignored)
+     * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
+     */
+    setView(xMin, xMax, yMin, yMax, source, causedByUser = false) {
+        if (source === this || this.state.renderStatus === RenderStatus.NO_DATA)
+            return;
+
+        if (xMin === undefined) xMin = this.xScale.domain()[0]; // TODO band scale
+        if (xMax === undefined) xMax = this.xScale.domain()[1];
+        if (yMin === undefined) yMin = this.yScale.domain()[0];
+        if (yMax === undefined) yMax = this.yScale.domain()[1];
+
+        if (this.overviewXScale(xMin) === undefined || this.overviewXScale(xMax) === undefined || this.overviewYScale(yMin) === undefined || this.overviewYScale(yMax) === undefined)
+            throw new Error("Parameters out of range.");
+
+        this.lastZoomCausedByUser = causedByUser;
+        this.setZoomToLimits(xMin, xMax, yMin, yMax);
+    }
+
+    /**
+     * Resets the visible region of the chart to the initial
+     * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
+     */
+    resetZoom(causedByUser = false) {
+        this.lastZoomCausedByUser = causedByUser;
+        this.setZoom(d3Zoom.zoomIdentity, 1);
+    }
+
+    /**
+     * Calls the props.viewChangeCallback method
+     */
+    callViewChangeCallback() {
+        if (typeof(this.props.viewChangeCallback) !== "function")
+            return;
+
+        this.props.viewChangeCallback(this, this.getView(), this.lastZoomCausedByUser);
+    }
+    //</editor-fold>
+
+    //<editor-fold desc="Helper functions to set the view">
+    /** Updates overview brushes from zoom transform values. */
+    moveBrush(transform, zoomYScaleMultiplier) {
+        if (!this.defaultBrushX || !this.defaultBrushY) // no data
+            return;
+        const [newBrushX, newBrushY, _] = this.getBrushValuesFromZoomValues(transform, zoomYScaleMultiplier);
+        if (newBrushX && this.brushX)
+            this.overviewXBrushSelection.call(this.brushX.move, newBrushX);
+        else
+            this.brushXValues = newBrushX;
+        if (newBrushY && this.brushY)
+            this.overviewYBrushSelection.call(this.brushY.move, newBrushY);
+        else
+            this.brushYValues = newBrushY;
+    };
+
+    /** Computes values for brushes from the zoom transform. Also returns a bool which indicates whether the transform needs to be updated in order to enforce the maximum extents of the brushes. */
     getBrushValuesFromZoomValues(transform, zoomYScaleMultiplier) {
         let updated = false;
         let newBrushX = this.defaultBrushX.map(transform.invertX, transform);
@@ -288,7 +371,6 @@ export class ZoomableChartBase extends Component {
             }
         }
         else {
-            // zoom disabled -> use values from brushes
             updated = true;
             if (!this.props.withZoomX) {
                 newBrushX = this.brushXValues || this.defaultBrushX;
@@ -300,112 +382,171 @@ export class ZoomableChartBase extends Component {
         return [newBrushX, newBrushY, updated];
     }
 
-    /** Returns the current view (boundaries of visible region)
-     * @return {{xMin, xMax, yMin, yMax }} left, right, bottom, top boundary (numbers or strings based on the type of data on each axis)
-     */
-    getView() {
-        const [xMin, xMax] = this.xScale.domain();
-        const [yMin, yMax] = this.yScale.domain();
-        return {xMin, xMax, yMin, yMax};
+    /** Computes the zoom transform from the values of brushes. */
+    getZoomValuesFromBrushValues(brushX, brushY) {
+        if (!brushX) brushX = this.defaultBrushX;
+        if (!brushY) brushY = this.defaultBrushY;
+        const newXSize = brushX[1] - brushX[0];
+        const newYSize = brushY[1] - brushY[0];
+        const newXScaling = this.xSize / newXSize;
+        const newYScaling = this.ySize / newYSize;
+        const newZoomYScaleMultiplier = newYScaling / newXScaling;
+        const transform = d3Zoom.zoomIdentity.scale(newXScaling).translate(-brushX[0], -brushY[0] * newZoomYScaleMultiplier);
+        return [transform, newZoomYScaleMultiplier];
     }
 
-    /**
-     * Set the visible region of the chart to defined limits (in units of the data, not in pixels). If the axis data type is keyword (string), both boundary values are included.
-     * @param xMin          left boundary of the visible region (in units of data on x-axis)
-     * @param xMax          right boundary of the visible region (in units of data on x-axis)
-     * @param yMin          bottom boundary of the visible region (in units of data on x-axis)
-     * @param yMax          top boundary of the visible region (in units of data on x-axis)
-     * @param source        the element which caused the view change (if source === this, the update is ignored)
-     * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
-     */
-    setView(xMin, xMax, yMin, yMax, source, causedByUser = false) {
-        if (source === this || this.state.renderStatus === RenderStatus.NO_DATA)
-            return;
+    /** Updates the zoom object with current brush values */
+    updateZoomFromBrush() {
+        const [transform, newZoomYScaleMultiplier] = this.getZoomValuesFromBrushValues(this.brushXValues, this.brushYValues);
 
-        // TODO
-
-        if (xMin === undefined) xMin = this.xScale.domain()[0];
-        if (xMax === undefined) xMax = this.xScale.domain()[1];
-
-        if (isNaN(xMin) || isNaN(xMax))
-            throw new Error("Parameters must be numbers.");
-
-        this.lastZoomCausedByUser = causedByUser;
-        this.setZoomToLimits(xMin, xMax);
+        this.setState({
+            zoomYScaleMultiplier: newZoomYScaleMultiplier
+        }, () => this.setZoom(transform, newZoomYScaleMultiplier));
     }
 
-    /**
-     * Resets the visible region of the chart to the initial
-     * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
-     */
-    resetZoom(causedByUser = false) {
-        this.lastZoomCausedByUser = causedByUser;
+    /** Helper method to update zoom transform in state and zoom object. */
+    setZoom(transform, zoomYScaleMultiplier, withTransition = false) {
+        const self = this;
 
-        if (this.brushX)
-            this.overviewXBrushSelection.call(this.brushX.move, this.defaultBrushX);
-        else
-            this.updateXViewInState(0, this.xSize);
-
-        if (this.brushY)
-            this.overviewYBrushSelection.call(this.brushY.move, this.defaultBrushY);
-        else
-            this.updateYViewInState(0, this.ySize);
-    }
-
-    /**
-     * Calls the props.viewChangeCallback method
-     */
-    callViewChangeCallback() {
-        if (typeof(this.props.viewChangeCallback) !== "function")
-            return;
-
-        this.props.viewChangeCallback(this, this.getView(), this.lastZoomCausedByUser);
-    }
-
-    /** Sets the view along the x-axis (moves the brush). Argument values are in pixels, relative to the current view. */
-    updateXView(left, right) {
-        if (left >= 0 && right <= this.xSize && left < right) {
-            left = this.getXZoomTransform().invertX(left);
-            right = this.getXZoomTransform().invertX(right);
-
-            if (this.brushX)
-                this.overviewXBrushSelection.call(this.brushX.move, [left, right]);
-            else
-                this.updateXViewInState(left, right);
+        if (this.zoom) {
+            if (this.props.withTransition && withTransition) {
+                const transition = this.svgContainerSelection.transition().duration(150)
+                    .tween("yZoom", () => function (t) {
+                        self.setState({
+                            zoomYScaleMultiplier: self.state.zoomYScaleMultiplier * (1 - t) + zoomYScaleMultiplier * t
+                        });
+                    });
+                transition.call(this.zoom.transform, transform);
+            } else {
+                if (zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier)
+                    this.setState({ zoomYScaleMultiplier });
+                this.svgContainerSelection.call(this.zoom.transform, transform);
+            }
+        }
+        else {
+            if (this.props.withTransition && withTransition) {
+                this.setState({zoomInProgress: true}, () => {
+                    transitionInterpolate(this.svgContainerSelection, this.state.zoomTransform, transform,
+                        setZoomTransform(this), () => {
+                            self.setState({zoomInProgress: false});
+                            self.moveBrush(transform, zoomYScaleMultiplier);
+                        }, 150, self.state.zoomYScaleMultiplier, zoomYScaleMultiplier);
+                });
+            }
+            else {
+                this.setState({
+                    zoomTransform: transform,
+                    zoomYScaleMultiplier
+                });
+                this.moveBrush(transform, zoomYScaleMultiplier);
+            }
         }
     }
 
-    /** Sets the view along the y-axis (moves the brush). Argument values are in pixels, relative to the current view. */
-    updateYView(top, bottom) {
-        if (top >= 0 && bottom <= this.ySize && top < bottom) {
-            top = this.getYZoomTransform().invertY(top);
-            bottom = this.getYZoomTransform().invertY(bottom);
-
-            if (this.brushY)
-                this.overviewYBrushSelection.call(this.brushY.move, [top, bottom]);
-            else
-                this.updateYViewInState(top, bottom);
-        }
+    /** Sets zoom object (transform) to desired view boundaries (in units of data). If the axis data type is keyword (string), both boundary values are included. */
+    setZoomToLimits(xMin, xMax, yMin, yMax) { // TODO
+        if (this.xType === DataType.NUMBER)
+            this.brushXValues = [this.originalXScale(xMin), this.originalXScale(xMax)];
+        else
+            this.brushXValues = [this.originalXScale(xMin), this.originalXScale(xMax) + this.originalXScale.bandwidth()];
+        if (this.yType === DataType.NUMBER)
+            this.brushYValues = [this.originalYScale(yMax), this.originalYScale(yMin)];
+        else
+            this.brushYValues = [this.originalYScale(yMax), this.originalYScale(yMin) + this.originalYScale.bandwidth()];
+        this.updateZoomFromBrush();
     }
+    //</editor-fold>
 
-    /** Helper function to update the state. */
-    updateXViewInState(left, right) {
-        if (left >= 0 && right <= this.xSize && left < right)
-            if (this.state.viewX[0] !== left || this.state.viewX[1] !== right)
-                this.setState({
-                    viewX: [left, right]
-                })
+    //<editor-fold desc="Zoom (by mouse and touch)">
+    createChartZoom(xSize, ySize) {
+        // noinspection DuplicatedCode
+        const self = this;
+
+        const handleZoom = function () {
+            if (self.ignoreZoomEvents) return;
+            // noinspection JSUnresolvedVariable
+            let newTransform = d3Event.transform;
+            let newZoomYScaleMultiplier = self.state.zoomYScaleMultiplier;
+            // check brush extents
+            const [newBrushX, newBrushY, updated] = self.getBrushValuesFromZoomValues(newTransform, newZoomYScaleMultiplier);
+            if (updated)
+                [newTransform, newZoomYScaleMultiplier] = self.getZoomValuesFromBrushValues(newBrushX, newBrushY);
+
+            // noinspection JSUnresolvedVariable
+            if (d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel" && self.props.withTransition) {
+                self.lastZoomCausedByUser = true;
+                self.ignoreZoomEvents = true;
+                transitionInterpolate(select(self), self.state.zoomTransform, newTransform, (t, y) => {
+                    setZoomTransform(self)(t, y);
+                    self.moveBrush(t, y || newZoomYScaleMultiplier); // sourceEvent is "wheel"
+                }, () => {
+                    self.ignoreZoomEvents = false;
+                    setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
+                    if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
+                        self.zoom.transform(self.svgContainerSelection, newTransform);
+                    self.moveBrush(newTransform, newZoomYScaleMultiplier);
+                    if (typeof self.props.onZoomEnd === 'function') self.props.onZoomEnd();
+                }, 150, self.state.zoomYScaleMultiplier, newZoomYScaleMultiplier);
+            } else {
+                // noinspection JSUnresolvedVariable
+                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
+                    self.lastZoomCausedByUser = true;
+
+                setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
+                if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
+                    self.zoom.transform(self.svgContainerSelection, newTransform);
+
+                // noinspection JSUnresolvedVariable
+                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && (d3Event.sourceEvent.target === self.brushX || d3Event.sourceEvent.target === self.brushY)) return;
+                self.moveBrush(newTransform, newZoomYScaleMultiplier);
+
+                if (typeof self.props.onZoom === 'function') self.props.onZoom(d3Event, newTransform, newZoomYScaleMultiplier);
+            }
+        };
+
+        const handleZoomEnd = function () {
+            self.setState({
+                zoomInProgress: false
+            });
+            if (typeof self.props.onZoomEnd === 'function') self.props.onZoomEnd(d3Event);
+        };
+        const handleZoomStart = function () {
+            self.setState({
+                zoomInProgress: true
+            });
+            if (typeof self.props.onZoomStart === 'function') self.props.onZoomStart(d3Event);
+        };
+
+        const zoomExtent = [[0, 0], [xSize, ySize]];
+        const translateExtent = [[0, 0], [xSize, ySize * this.state.zoomYScaleMultiplier]];
+        let minZoom = Math.min(this.props.zoomLevelMin, this.props.zoomLevelMin / this.state.zoomYScaleMultiplier);
+        if (this.props.withZoomY && !this.props.withZoomX)
+            minZoom = this.props.zoomLevelMin / this.state.zoomYScaleMultiplier;
+        else if (!this.props.withZoomY && this.props.withZoomX)
+            minZoom = this.props.zoomLevelMin;
+
+        const zoomExisted = this.zoom !== null;
+        this.zoom = zoomExisted ? this.zoom : d3Zoom.zoom();
+        this.zoom
+            .scaleExtent([minZoom, this.props.zoomLevelMax])
+            .translateExtent(translateExtent)
+            .extent(zoomExtent)
+            .filter(() => {
+                // noinspection JSUnresolvedVariable
+                return !d3Selection.event.ctrlKey && !d3Selection.event.button && !this.state.brushInProgress;
+            })
+            .on("zoom", handleZoom)
+            .on("end", handleZoomEnd)
+            .on("start", handleZoomStart)
+            .interpolate(d3Interpolate.interpolate)
+            .wheelDelta(WheelDelta(2));
+        this.svgContainerSelection.call(this.zoom);
+        if (d3Zoom.zoomTransform(this.svgContainerSelection.node()).k < minZoom)
+            this.svgContainerSelection.call(this.zoom.scaleTo, this.props.zoomLevelMin);
     }
+    //</editor-fold>
 
-    /** Helper function to update the state. */
-    updateYViewInState(top, bottom) {
-        if (top >= 0 && bottom <= this.ySize && top < bottom)
-            if (this.state.viewY[0] !== top || this.state.viewY[1] !== bottom)
-                this.setState({
-                    viewY: [top, bottom]
-                })
-    }
-
+    //<editor-fold desc="Overviews">
     /** Creates d3-brush for X overview.
      *  Called from this.createChart(). */
     createChartOverviewX(xSize) {
@@ -425,7 +566,6 @@ export class ZoomableChartBase extends Component {
         this.overviewX_ySize = overviewX_ySize;
 
         if (this.props.withOverviewXBrush) {
-            this.defaultBrushX = [0, xSize];
             const brushExisted = this.brushX !== null;
             this.brushX = brushExisted ? this.brushX : d3Brush.brushX(); // this is permanent brush in the overview
             this.brushX
@@ -435,16 +575,15 @@ export class ZoomableChartBase extends Component {
                     // noinspection JSUnresolvedVariable
                     const sel = d3Event.selection;
                     self.overviewXBrushSelection.call(brushHandlesLeftRight, sel, overviewX_ySize);
-
-                    /*// noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "zoom" && d3Event.sourceEvent.target === self.zoom) return; // ignore brush-by-zoom
                     // noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && d3Event.sourceEvent.target === self.brushX) return; // ignore brush by itself*/
+                    self.brushXValues = d3Event.selection;
 
                     // noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                        self.lastZoomCausedByUser = true;
-                    self.updateXViewInState(...sel);
+                    if (d3Event.sourceEvent && d3Event.sourceEvent.type !== "zoom" && d3Event.sourceEvent.type !== "brush" && d3Event.sourceEvent.type !== "end") { // ignore brush by zoom
+                        if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
+                            self.lastZoomCausedByUser = true;
+                        self.updateZoomFromBrush();
+                    }
                 });
 
             this.overviewXBrushSelection
@@ -452,6 +591,11 @@ export class ZoomableChartBase extends Component {
                 .call(this.brushX);
             if (!brushExisted)
                 this.overviewXBrushSelection.call(this.brushX.move, this.defaultBrushX);
+
+            // ensure that brush is not outside the extent
+            if (this.brushXValues && (this.brushXValues[0] < this.defaultBrushX[0] || this.brushXValues[1] > this.defaultBrushX[1]))
+                this.overviewXBrushSelection.call(this.brushX.move, [Math.max(this.brushXValues[0], this.defaultBrushX[0]), Math.min(this.brushXValues[1], this.defaultBrushX[1])]);
+
             this.overviewXBrushSelection.select(".selection")
                 .classed(styles.selection, true);
             this.overviewXBrushSelection.select(".overlay")
@@ -482,7 +626,6 @@ export class ZoomableChartBase extends Component {
         this.overviewY_xSize = overviewY_xSize;
 
         if (this.props.withOverviewYBrush) {
-            this.defaultBrushY = [0, ySize];
             const brushExisted = this.brushY !== null;
             this.brushY = brushExisted ? this.brushY : d3Brush.brushY(); // this is permanent brush in the overview
             this.brushY
@@ -492,16 +635,15 @@ export class ZoomableChartBase extends Component {
                     // noinspection JSUnresolvedVariable
                     const sel = d3Event.selection;
                     self.overviewYBrushSelection.call(brushHandlesTopBottom, sel, overviewY_xSize);
-
-                    /*// noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "zoom" && d3Event.sourceEvent.target === self.zoom) return; // ignore brush-by-zoom
                     // noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && d3Event.sourceEvent.target === self.brushX) return; // ignore brush by itself*/
+                    self.brushYValues = d3Event.selection;
 
                     // noinspection JSUnresolvedVariable
-                    if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                        self.lastZoomCausedByUser = true;
-                    self.updateYViewInState(...sel);
+                    if (d3Event.sourceEvent && d3Event.sourceEvent.type !== "zoom" && d3Event.sourceEvent.type !== "brush" && d3Event.sourceEvent.type !== "end") { // ignore brush by zoom
+                        if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
+                            self.lastZoomCausedByUser = true;
+                        self.updateZoomFromBrush();
+                    }
                 });
 
             this.overviewYBrushSelection
@@ -509,6 +651,11 @@ export class ZoomableChartBase extends Component {
                 .call(this.brushY);
             if (!brushExisted)
                 this.overviewYBrushSelection.call(this.brushY.move, this.defaultBrushY);
+
+            // ensure that brush is not outside the extent
+            if (this.brushYValues && (this.brushYValues[0] < this.defaultBrushY[0] || this.brushYValues[1] > this.defaultBrushY[1]))
+                this.overviewYBrushSelection.call(this.brushY.move, [Math.max(this.brushYValues[0], this.defaultBrushY[0]), Math.min(this.brushYValues[1], this.defaultBrushY[1])]);
+
             this.overviewYBrushSelection.select(".selection")
                 .classed(styles.selection, true);
             this.overviewYBrushSelection.select(".overlay")
@@ -519,6 +666,7 @@ export class ZoomableChartBase extends Component {
         if (this.props.createChartOverviewY)
             this.props.createChartOverviewY(this, this.originalYScale, overviewY_xSize, ySize);
     }
+    //</editor-fold>
 
     //<editor-fold desc="Brush in the main chart area (only when CTRL is held)">
     keydownListener(event) {
@@ -556,8 +704,13 @@ export class ZoomableChartBase extends Component {
                     if (sel) {
                         self.lastZoomCausedByUser = true;
                         const [[x0, y0], [x1, y1]] = sel;
-                        self.updateXView(x0, x1);
-                        self.updateYView(y0, y1);
+
+                        const left = self.getXZoomTransform().invertX(x0);
+                        const right = self.getXZoomTransform().invertX(x1);
+                        const top = self.getYZoomTransform().invertY(y0);
+                        const bottom = self.getYZoomTransform().invertY(y1);
+
+                        self.setZoom(...self.getZoomValuesFromBrushValues([left, right], [top, bottom]), /* withTransition */ true);
 
                         // hide brush
                         self.brushSelection.call(brush.move, null);
@@ -626,7 +779,8 @@ export class ZoomableChartBase extends Component {
                                           height={this.props.margin.bottom} /* same reason for 6 as in HeatmapChart */ />
                                 </clipPath>
                             </defs>
-                            <g /* Graph content */ transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" >
+                            <g /* Graph content */ transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" ref={node => { this.graphNode = node; this.graphSelection = select(node);} }>
+                                <rect fill="black" stroke="none" x={0} y={0} width={this.xSize} height={this.ySize} visibility="hidden" />
                                 {this.props.getGraphContent(this, this.xScale, this.yScale, this.xSize, this.ySize)}
                             </g>
 

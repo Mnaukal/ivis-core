@@ -11,6 +11,7 @@ import {withComponentMixins} from "../lib/decorator-helpers";
 import {withTranslation} from "../lib/i18n";
 import styles from "./CorrelationCharts.scss";
 import {
+    AreZoomTransformsEqual,
     brushHandlesLeftRight,
     RenderStatus,
     transitionInterpolate,
@@ -29,8 +30,6 @@ export class XZoomableChartBase extends Component {
     constructor(props){
         super(props);
 
-        const t = props.t;
-
         this.state = {
             zoomTransform: d3Zoom.zoomIdentity,
             width: 0,
@@ -41,6 +40,7 @@ export class XZoomableChartBase extends Component {
         this.ySize = 0;
 
         this.zoom = null;
+        this.brush = null;
         this.brushX = null;
         this.lastZoomCausedByUser = false;
 
@@ -128,7 +128,7 @@ export class XZoomableChartBase extends Component {
     /** Update and redraw the chart based on changes in React props and state */
     componentDidUpdate(prevProps, prevState) {
         const forceRefresh = this.prevContainerNode !== this.containerNode || prevState.brushInProgress !== this.state.brushInProgress;
-        const updateZoom = !Object.is(prevState.zoomTransform, this.state.zoomTransform);
+        const updateZoom = !AreZoomTransformsEqual(prevState.zoomTransform, this.state.zoomTransform);
 
         this.createChart(forceRefresh, updateZoom);
         this.prevContainerNode = this.containerNode;
@@ -286,7 +286,7 @@ export class XZoomableChartBase extends Component {
      * @return {{xMin: number, xMax: number }} left, right boundary
      */
     getView() {
-        const [xMin, xMax] = this.xScale.domain();
+        const [xMin, xMax] = this.xScale.domain(); // TODO band scale
         return {xMin, xMax};
     }
 
@@ -483,6 +483,7 @@ export class XZoomableChartBase extends Component {
                         });
                     }
                 });
+            this.brush = brush;
 
             this.brushSelection
                 .attr('pointer-events', 'all')
@@ -494,6 +495,7 @@ export class XZoomableChartBase extends Component {
                 .remove();
             this.brushSelection
                 .attr('pointer-events', 'none');
+            this.brush = null;
         }
     }
     //</editor-fold>
