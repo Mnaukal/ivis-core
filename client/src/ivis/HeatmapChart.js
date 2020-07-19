@@ -20,6 +20,7 @@ import {withTranslation} from "../lib/i18n";
 import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
 import {
+    AreZoomTransformsEqual,
     brushHandlesLeftRight,
     brushHandlesTopBottom,
     getColorScale, setZoomTransform,
@@ -133,6 +134,7 @@ export class HeatmapChart extends Component {
         this.brushLeft = null;
         this.zoom = null;
         this.lastZoomCausedByUser = false;
+        this.ignoreZoomEvents = false;
 
         this.resizeListener = () => {
             this.createChart(true);
@@ -262,7 +264,7 @@ export class HeatmapChart extends Component {
         }
 
         if (configDiff === ConfigDifference.DATA_WITH_CLEAR) {
-            this.setZoom(d3Zoom.zoomIdentity); // reset zoom
+            this.setZoom(d3Zoom.zoomIdentity, 1); // reset zoom
             this.setState({
                 statusMsg: t('Loading...')
             }, () => {
@@ -276,10 +278,10 @@ export class HeatmapChart extends Component {
         } else {
             const forceRefresh = this.prevContainerNode !== this.containerNode
                 || prevState.signalSetData !== this.state.signalSetData
-                || prevState.zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier // update zoom extent
                 || configDiff !== ConfigDifference.NONE;
 
-            const updateZoom = !Object.is(prevState.zoomTransform, this.state.zoomTransform);
+            const updateZoom = !AreZoomTransformsEqual(prevState.zoomTransform, this.state.zoomTransform)
+                || prevState.zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier;
 
             this.createChart(forceRefresh, updateZoom);
             this.prevContainerNode = this.containerNode;
@@ -646,16 +648,16 @@ export class HeatmapChart extends Component {
         if (this.props.withOverviewBottom)
             this.createChartOverviewBottom(signalSetData.buckets, this.overviewXScale, d3Color.color(this.props.overviewBottomColor || colors[colors.length - 1]));
 
-        // we don't want to change zoom object and cursor area when updating only zoom (it breaks touch drag)
+        // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
         if (forceRefresh || widthChanged) {
             this.createChartCursorArea(width, height);
-            if (this.props.withZoomX || this.props.withZoomY)
-                this.createChartZoom(xSize, ySize);
-            if (this.props.withOverviewLeft && this.props.withOverviewLeftBrush)
-                this.createChartOverviewLeftBrush();
-            if (this.props.withOverviewBottom && this.props.withOverviewBottomBrush)
-                this.createChartOverviewBottomBrush();
         }
+        if (this.props.withZoomX || this.props.withZoomY)
+            this.createChartZoom(xSize, ySize);
+        if (this.props.withOverviewLeft && this.props.withOverviewLeftBrush)
+            this.createChartOverviewLeftBrush();
+        if (this.props.withOverviewBottom && this.props.withOverviewBottomBrush)
+            this.createChartOverviewBottomBrush();
     }
 
     /** Prepares rectangle for cursor movement events.
@@ -787,6 +789,7 @@ export class HeatmapChart extends Component {
         const self = this;
 
         const handleZoom = function () {
+            if (self.ignoreZoomEvents) return;
             // noinspection JSUnresolvedVariable
             let newTransform = d3Event.transform;
             let newZoomYScaleMultiplier = self.state.zoomYScaleMultiplier;
@@ -798,12 +801,16 @@ export class HeatmapChart extends Component {
             // noinspection JSUnresolvedVariable
             if (d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel" && self.props.withTransition) {
                 self.lastZoomCausedByUser = true;
+                self.ignoreZoomEvents = true;
                 transitionInterpolate(select(self), self.state.zoomTransform, newTransform, (t, y) => {
                     setZoomTransform(self)(t, y);
                     self.moveBrush(t, y || newZoomYScaleMultiplier); // sourceEvent is "wheel"
                 }, () => {
+                    self.ignoreZoomEvents = false;
                     self.deselectPoints();
                     setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
+                    if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
+                        self.zoom.transform(self.svgContainerSelection, newTransform);
                     self.moveBrush(newTransform, newZoomYScaleMultiplier);
                 }, 150, self.state.zoomYScaleMultiplier, newZoomYScaleMultiplier);
             } else {
@@ -812,6 +819,8 @@ export class HeatmapChart extends Component {
                     self.lastZoomCausedByUser = true;
 
                 setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
+                if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
+                    self.zoom.transform(self.svgContainerSelection, newTransform);
 
                 // noinspection JSUnresolvedVariable
                 if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && (d3Event.sourceEvent.target === self.brushLeft || d3Event.sourceEvent.target === self.brushBottom)) return;

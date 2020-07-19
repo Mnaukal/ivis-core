@@ -142,6 +142,15 @@ export function setZoomTransform(self, setStateCallback) {
 
 export const ZoomEventSources = ["mousemove", "dblclick", "wheel", "touchstart", "touchmove" ]; // source: https://github.com/d3/d3-zoom#api-reference (table with events - causing "zoom" event)
 
+export function AreZoomTransformsEqual(a, b, scale_epsilon = 0.001, translate_epsilon = 0.01) {
+    if (!(a.hasOwnProperty("x") && a.hasOwnProperty("y") && a.hasOwnProperty("k"))) return false;
+    if (!(b.hasOwnProperty("x") && b.hasOwnProperty("y") && b.hasOwnProperty("k"))) return false;
+    if (Math.abs(a.k - b.k) > scale_epsilon) return false;
+    if (Math.abs(a.x - b.x) > translate_epsilon) return false;
+    if (Math.abs(a.y - b.y) > translate_epsilon) return false;
+    return true;
+}
+
 export const RenderStatus = {
     SUCCESS: 0,
     NO_DATA: 1
