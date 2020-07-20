@@ -7,6 +7,7 @@ import * as d3Selection from "d3-selection";
 import * as d3Zoom from "d3-zoom";
 import * as d3Brush from "d3-brush";
 import * as d3Interpolate from "d3-interpolate";
+import * as d3Transition from "d3-transition";
 import {withErrorHandling} from "../lib/error-handling";
 import PropTypes from "prop-types";
 import {withComponentMixins} from "../lib/decorator-helpers";
@@ -18,6 +19,7 @@ import {
     RenderStatus, setZoomTransform, transitionInterpolate, WheelDelta,
     ZoomEventSources
 } from "./common";
+import {set} from "immutable";
 
 /**
  * Base class for charts with zoom.
@@ -25,7 +27,7 @@ import {
 @withComponentMixins([
     withTranslation,
     withErrorHandling
-], ["getView", "setView", "getXZoomTransform", "getYZoomTransform", "resetZoom", "createChart", "callViewChangeCallback", "setBrushEnabled"])
+], ["getView", "setView", "getXZoomTransform", "getYZoomTransform", "resetZoom", "createChart", "resetChart", "callViewChangeCallback", "setBrushEnabled"])
 export class ZoomableChartBase extends Component {
     constructor(props){
         super(props);
@@ -79,7 +81,7 @@ export class ZoomableChartBase extends Component {
 
         createChart: PropTypes.func.isRequired, // createChart(base, forceRefresh, updateZoom, updated_xScale, yScale, xSize, ySize)
         createChartOverview: PropTypes.func, // createChartOverview(base, original_xScale, xSize, overview_ySize)
-        prepareChart: PropTypes.func, // prepareChart(base, forceRefresh, updateZoom, updated_xScale, xSize, ySize) - called before the props.createChart so that the data can be filtered and the yScale in the createChart method call corresponds to the filtered data
+        prepareChart: PropTypes.func, // prepareChart(base, forceRefresh, updateZoom, updated_xScale, updated_yScale, xSize, ySize) - called before the props.createChart so that the data can be filtered and the yScale in the createChart method call corresponds to the filtered data
         getGraphContent: PropTypes.func.isRequired, // getGraphContent(base, updated_xScale, yScale, xSize, ySize)
         getOverviewContent: PropTypes.func, // getOverviewContent(base, original_xScale, xSize, overview_ySize)
         getSvgDefs: PropTypes.func, // getSvgDefs(base, xScale, yScale, xSize, ySize)
@@ -188,7 +190,7 @@ export class ZoomableChartBase extends Component {
 
         // prepare the data in the child - update it according to the new xScale
         if (this.props.prepareChart)
-            this.props.prepareChart(this, forceRefresh || widthChanged, updateZoom, this.xScale, xSize, ySize);
+            this.props.prepareChart(this, forceRefresh || widthChanged, updateZoom, this.xScale, this.yScale, xSize, ySize);
 
         // if zoom is enabled for only one axis, get the other scale as it could be altered by the props.prepareChart method
         if (!this.props.withZoomY && !this.props.withOverviewYBrush)
@@ -199,8 +201,28 @@ export class ZoomableChartBase extends Component {
         // everything is prepared, now call the createChart method of the child
         const renderStatus = this.props.createChart(this, forceRefresh || widthChanged, updateZoom, this.xScale, this.yScale, xSize, ySize);
         if (renderStatus !== this.state.renderStatus)
-            this.setState({renderStatus});
-        if (renderStatus === RenderStatus.NO_DATA)
+            this.setState({ renderStatus }, () => {
+                if (renderStatus === RenderStatus.NO_DATA)
+                    this.resetChart();
+                this.drawChart(forceRefresh, updateZoom, xSize, ySize)
+            });
+        else
+            this.drawChart(forceRefresh, updateZoom, xSize, ySize);
+    }
+
+    /** Resets all the zoom and brush behaviours.  */
+    resetChart() {
+        this.zoom = null;
+        this.brush = null;
+        this.brushX = null;
+        this.brushY = null;
+
+        this.lastZoomCausedByUser = false;
+        this.ignoreZoomEvents = false;
+    }
+
+    drawChart(forceRefresh, updateZoom, xSize, ySize) {
+        if (this.state.renderStatus === RenderStatus.NO_DATA)
             return;
 
         // draw the axes - update the yScale before drawing it - it might have changed in this.props.createChart
@@ -227,6 +249,10 @@ export class ZoomableChartBase extends Component {
     updateXScale(xSize) {
         let xScale = this.props.getXScale(/* range: */ [0, xSize]);
         this.originalXScale = xScale;
+        if (xScale === null) {
+            this.xScale = xScale;
+            return;
+        }
 
         if (typeof xScale.invert === "function")
             this.xScale = this.getXZoomTransform().rescaleX(xScale);
@@ -237,6 +263,10 @@ export class ZoomableChartBase extends Component {
     updateYScale(ySize) {
         let yScale = this.props.getYScale(/* range: */ [ySize, 0]);
         this.originalYScale = yScale;
+        if (yScale === null) {
+            this.yScale = yScale;
+            return;
+        }
 
         if (typeof yScale.invert === "function")
             this.yScale = this.getYZoomTransform().rescaleY(yScale);
@@ -314,7 +344,16 @@ export class ZoomableChartBase extends Component {
      */
     resetZoom(causedByUser = false) {
         this.lastZoomCausedByUser = causedByUser;
-        this.setZoom(d3Zoom.zoomIdentity, 1);
+        // first set state so that this.getXZoomTransform and this.getYZoomTransform return correct values
+        this.setState({
+            zoomTransform: d3Zoom.zoomIdentity,
+            zoomYScaleMultiplier: 1
+        }, () => {
+            // reset brushes and zoom object
+            this.brushXValues = this.defaultBrushX;
+            this.brushYValues = this.defaultBrushY;
+            this.updateZoomFromBrush();
+        })
     }
 
     /**
@@ -541,8 +580,8 @@ export class ZoomableChartBase extends Component {
             .interpolate(d3Interpolate.interpolate)
             .wheelDelta(WheelDelta(2));
         this.svgContainerSelection.call(this.zoom);
-        if (d3Zoom.zoomTransform(this.svgContainerSelection.node()).k < minZoom)
-            this.svgContainerSelection.call(this.zoom.scaleTo, this.props.zoomLevelMin);
+        //if (d3Zoom.zoomTransform(this.svgContainerSelection.node()).k < minZoom)
+        //    this.svgContainerSelection.call(this.zoom.scaleTo, this.props.zoomLevelMin);
     }
     //</editor-fold>
 
@@ -710,14 +749,37 @@ export class ZoomableChartBase extends Component {
                         const top = self.getYZoomTransform().invertY(y0);
                         const bottom = self.getYZoomTransform().invertY(y1);
 
-                        self.setZoom(...self.getZoomValuesFromBrushValues([left, right], [top, bottom]), /* withTransition */ true);
+                        const oldBrushX = self.brushXValues;
+                        const oldBrushY = self.brushYValues;
+                        const newBrushX = [left, right];
+                        const newBrushY = [top, bottom];
+                        const brushX = d3Interpolate.interpolateNumberArray(oldBrushX, newBrushX);
+                        const brushY = d3Interpolate.interpolateNumberArray(oldBrushY, newBrushY);
+
+                        const setFinalBrushValues = function() {
+                            self.brushXValues = newBrushX;
+                            self.brushYValues = newBrushY;
+                            self.updateZoomFromBrush();
+                            self.setState({
+                                brushInProgress: false,
+                                zoomInProgress: false
+                            });
+                        }
+
+                        if (self.props.withTransition) {
+                            d3Transition.transition("brushed").duration(150)
+                                .tween("brushed", () => function (t) {
+                                    self.brushXValues = brushX(t);
+                                    self.brushYValues = brushY(t);
+                                    self.updateZoomFromBrush();
+                                })
+                                .on("end", setFinalBrushValues);
+                        }
+                        else
+                            setFinalBrushValues()
 
                         // hide brush
                         self.brushSelection.call(brush.move, null);
-                        self.setState({
-                            brushInProgress: false,
-                            zoomInProgress: false
-                        });
                     }
                 });
 
@@ -774,9 +836,12 @@ export class ZoomableChartBase extends Component {
                                 <clipPath id="plotRect">
                                     <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.height - this.props.margin.top - this.props.margin.bottom} />
                                 </clipPath>
+                                <clipPath id="leftAxis">
+                                    <rect x={-this.props.margin.left + 1} y={0} width={this.props.margin.left} height={this.props.height - this.props.margin.top - this.props.margin.bottom + 6} /* 6 is default size of axis ticks, so we can add extra space in the bottom left corner for this axis and still don't collide with the other axis. Thanks to this, the first tick text should not be cut in half. */ />
+                                </clipPath>
                                 <clipPath id="bottomAxis">
                                     <rect x={-6} y={0} width={this.state.width - this.props.margin.left - this.props.margin.right + 6}
-                                          height={this.props.margin.bottom} /* same reason for 6 as in HeatmapChart */ />
+                                          height={this.props.margin.bottom} /* same reason for 6 as above */ />
                                 </clipPath>
                             </defs>
                             <g /* Graph content */ transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" ref={node => { this.graphNode = node; this.graphSelection = select(node);} }>
@@ -789,7 +854,7 @@ export class ZoomableChartBase extends Component {
                             <text ref={node => this.xAxisLabelSelection = select(node)}
                                   transform={`translate(${this.props.margin.left + (this.state.width - this.props.margin.left - this.props.margin.right) / 2}, ${this.props.height - 5})`} />
 
-                            <g ref={node => this.yAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
+                            <g ref={node => this.yAxisSelection = select(node)} transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#leftAxis)" />
                             <text ref={node => this.yAxisLabelSelection = select(node)}
                                   transform={`translate(${15}, ${this.props.margin.top + (this.props.height - this.props.margin.top - this.props.margin.bottom) / 2}) rotate(-90)`} />
 

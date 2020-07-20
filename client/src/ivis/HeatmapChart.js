@@ -1,16 +1,13 @@
 'use strict';
 
 import React, {Component} from "react";
-import * as d3Axis from "d3-axis";
 import * as d3Scale from "d3-scale";
 import * as d3Format from "d3-format";
 import * as d3Selection from "d3-selection";
-import {event as d3Event, select} from "d3-selection";
+import {select} from "d3-selection";
 import * as d3Array from "d3-array";
 import * as d3Color from "d3-color";
 import * as d3Zoom from "d3-zoom";
-import * as d3Brush from "d3-brush";
-import * as d3Interpolate from "d3-interpolate";
 import {intervalAccessMixin} from "./TimeContext";
 import {DataAccessSession} from "./DataAccess";
 import {withAsyncErrorHandler, withErrorHandling} from "../lib/error-handling";
@@ -21,15 +18,10 @@ import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
 import {
     AreZoomTransformsEqual,
-    brushHandlesLeftRight,
-    brushHandlesTopBottom,
-    getColorScale, setZoomTransform,
-    transitionInterpolate,
-    WheelDelta,
-    ZoomEventSources
+    getColorScale, RenderStatus,
 } from "./common";
-import styles from "./CorrelationCharts.scss";
 import {PropType_d3Color} from "../lib/CustomPropTypes";
+import {ZoomableChartBase} from "./ZoomableChartBase";
 
 const ConfigDifference = {
     NONE: 0,
@@ -126,15 +118,10 @@ export class HeatmapChart extends Component {
             height: 0,
             maxBucketCountX: 0,
             maxBucketCountY: 0,
-            zoomTransform: d3Zoom.zoomIdentity,
-            zoomYScaleMultiplier: 1,
         };
 
-        this.brushBottom = null;
-        this.brushLeft = null;
-        this.zoom = null;
-        this.lastZoomCausedByUser = false;
-        this.ignoreZoomEvents = false;
+        this.xExtent = [0, 0];
+        this.yExtent = [0, 0];
 
         this.resizeListener = () => {
             this.createChart(true);
@@ -264,7 +251,7 @@ export class HeatmapChart extends Component {
         }
 
         if (configDiff === ConfigDifference.DATA_WITH_CLEAR) {
-            this.setZoom(d3Zoom.zoomIdentity, 1); // reset zoom
+            this.base.resetZoom(true);
             this.setState({
                 statusMsg: t('Loading...')
             }, () => {
@@ -276,17 +263,10 @@ export class HeatmapChart extends Component {
             // noinspection JSIgnoredPromiseFromCall
             this.fetchData();
         } else {
-            const forceRefresh = this.prevContainerNode !== this.containerNode
-                || prevState.signalSetData !== this.state.signalSetData
+            const forceRefresh = prevState.signalSetData !== this.state.signalSetData
                 || configDiff !== ConfigDifference.NONE;
 
-            const updateZoom = !AreZoomTransformsEqual(prevState.zoomTransform, this.state.zoomTransform)
-                || prevState.zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier;
-
-            this.createChart(forceRefresh, updateZoom);
-            this.prevContainerNode = this.containerNode;
-            if (updateZoom)
-                this.callViewChangeCallback();
+            this.base.createChart(forceRefresh, false);
         }
     }
 
@@ -345,10 +325,12 @@ export class HeatmapChart extends Component {
                     filter.children.push(this.props.filter);
 
                 // filter by current zoom
-                if (!Object.is(this.state.zoomTransform, d3Zoom.zoomIdentity) || this.state.zoomYScaleMultiplier !== 1) {
-                    const scaleX = this.state.zoomTransform.k;
+                const zoomTransformX = this.base.getXZoomTransform();
+                const zoomTransformY = this.base.getYZoomTransform();
+                if (!AreZoomTransformsEqual(zoomTransformX, d3Zoom.zoomIdentity) || !AreZoomTransformsEqual(zoomTransformY, d3Zoom.zoomIdentity)) {
+                    const scaleX = zoomTransformX.k;
                     maxBucketCountX = Math.ceil(maxBucketCountX * scaleX);
-                    const scaleY = this.state.zoomTransform.k * this.state.zoomYScaleMultiplier;
+                    const scaleY = zoomTransformY.k;
                     maxBucketCountY = Math.ceil(maxBucketCountY * scaleY);
                 }
 
@@ -368,9 +350,6 @@ export class HeatmapChart extends Component {
                     this.xExtent = xExtent;
                     this.yExtent = yExtent;
                     if (processedResults.xBucketsCount === 0 || processedResults.yBucketsCount === 0) {
-                        this.brushBottom = null;
-                        this.brushLeft = null;
-                        this.zoom = null;
                         this.setState({
                             signalSetData: null,
                             statusMsg: this.props.t("No data.")
@@ -380,7 +359,7 @@ export class HeatmapChart extends Component {
 
                     this.setState({...processedResults, statusMsg: ""}, () => {
                         // call callViewChangeCallback when data new data without range filter are loaded as the xExtent and yExtent might got updated (even though this.state.zoomTransform is the same)
-                        this.callViewChangeCallback();
+                        this.base.callViewChangeCallback();
                     });
                 }
             } catch (err) {
@@ -531,94 +510,106 @@ export class HeatmapChart extends Component {
         return buckets.map(bucket => bucket.key);
     }
 
-    /** gets current xScale based on xType and current zoom */
-    getXScale() {
+    /** gets current xScale based on xType */
+    getXScale(range) {
+        if (!this.state.signalSetData) return null;
+
         if (this.xType === DataType.NUMBER)
-            return this.state.zoomTransform.rescaleX(d3Scale.scaleLinear()
+            return d3Scale.scaleLinear()
                 .domain(this.xExtent)
-                .range([0, this.xSize])
-            );
+                .range(range);
         else // this.xType === DataType.KEYWORD
             return d3Scale.scaleBand()
                 .domain(this.xExtent)
-                .range([0, this.xSize].map(d => this.state.zoomTransform.applyX(d)));
+                .range(range);
     }
 
-    /** gets current yScale based on yType and current zoom */
-    getYScale() {
-        const zoomTransformY = this.state.zoomTransform.scale(this.state.zoomYScaleMultiplier);
+    /** gets current yScale based on yType */
+    getYScale(range) {
+        if (!this.state.signalSetData) return null;
+
         if (this.yType === DataType.NUMBER)
-            return zoomTransformY.rescaleY(d3Scale.scaleLinear()
+            return d3Scale.scaleLinear()
                 .domain(this.yExtent)
-                .range([this.ySize, 0])
-            );
+                .range(range);
         else // this.yType === DataType.KEYWORD
             return d3Scale.scaleBand()
                 .domain(this.yExtent)
-                .range([this.ySize, 0].map(d => zoomTransformY.applyY(d)));
+                .range(range);
+    }
+
+    getGraphContent(base, xScale, yScale, xSize, ySize) {
+        return (<>
+            <g ref={node => this.columnsSelection = select(node)}/>
+            {!base.state.zoomInProgress &&
+                <g ref={node => this.highlightSelection = select(node)}/>}
+
+            {!base.state.zoomInProgress &&
+            <line ref={node => this.cursorSelection = select(node)} strokeWidth="1" stroke="rgb(50,50,50)" visibility="hidden"/>}
+            <text textAnchor="middle" x="50%" y="50%" fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
+                {this.state.statusMsg}
+            </text>
+
+            {this.props.withTooltip && !base.state.zoomInProgress &&
+            <Tooltip
+                config={this.props.config}
+                signalSetsData={this.state.signalSetData}
+                containerHeight={ySize}
+                containerWidth={xSize}
+                mousePosition={this.state.mousePosition}
+                selection={this.state.selection}
+                contentRender={props => <TooltipContent {...props} tooltipFormat={this.props.tooltipFormat} />}
+            />}
+
+            <g ref={node => this.cursorAreaSelection = select(node)} />
+        </>);
+    }
+
+    getOverviewXContent() {
+        return (
+            <g ref={node => this.overviewBottomBarsSelection = select(node)}/>
+        );
+    }
+
+    getOverviewYContent() {
+        return (
+            <g ref={node => this.overviewLeftBarsSelection = select(node)}/>
+        );
     }
 
     /** Creates (or updates) the chart with current data.
      * This method is called from componentDidUpdate automatically when state or config is updated.
      * All the 'createChart*' methods are called from here. */
-    createChart(forceRefresh, updateZoom) {
+    createChart(base, forceRefresh, updateZoom, xScale, yScale, xSize, ySize) {
         const signalSetData = this.state.signalSetData;
 
-        let width = this.containerNode.getClientRects()[0].width;
-        const height = this.props.height;
-
-        if (this.state.width !== width || this.state.height !== height) {
-            if (this.props.withOverviewLeft && this.state.width === undefined)
-                width -= this.props.overviewLeftWidth;
-            const maxBucketCountX = Math.ceil(width / this.props.minRectWidth);
-            const maxBucketCountY = Math.ceil(height / this.props.minRectHeight);
+        if (this.state.xSize !== xSize || this.state.ySize !== ySize) {
+            const maxBucketCountX = Math.ceil(xSize / this.props.minRectWidth);
+            const maxBucketCountY = Math.ceil(ySize / this.props.minRectHeight);
 
             this.setState({
-                width,
-                height,
+                xSize,
+                ySize,
                 maxBucketCountX,
                 maxBucketCountY
             });
         }
 
-        const widthChanged = width !== this.renderedWidth;
-        if (!forceRefresh && !widthChanged && !updateZoom) {
-            return;
-        }
-        this.renderedWidth = width;
-
         if (!signalSetData) {
-            return;
+            return RenderStatus.NO_DATA;
+        }
+        if (!forceRefresh && !updateZoom) {
+            return RenderStatus.SUCCESS;
         }
 
         //<editor-fold desc="Scales">
         // x axis
-        const xSize = width - this.props.margin.left - this.props.margin.right;
-        this.xSize = xSize;
-        const xScale = this.getXScale();
-        this.xScale = xScale;
-        const xAxis = d3Axis.axisBottom(xScale)
-            .tickSizeOuter(0);
-        if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
-        if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
-        this.xAxisSelection.call(xAxis);
-        this.xAxisLabelSelection.text(this.props.xAxisLabel).style("text-anchor", "middle");
         const xStep = signalSetData.step;
         const rectWidth = this.xType === DataType.NUMBER ?
             xScale(xStep) - xScale(0) :
             xScale.bandwidth();
 
         // y axis
-        const ySize = height - this.props.margin.top - this.props.margin.bottom;
-        this.ySize = ySize;
-        const yScale = this.getYScale();
-        this.yScale = yScale;
-        const yAxis = d3Axis.axisLeft(yScale)
-            .tickSizeOuter(0);
-        if (this.props.yAxisTicksCount) yAxis.ticks(this.props.yAxisTicksCount);
-        if (this.props.yAxisTicksFormat) yAxis.tickFormat(this.props.yAxisTicksFormat);
-        this.yAxisSelection.call(yAxis);
-        this.yAxisLabelSelection.text(this.props.yAxisLabel).style("text-anchor", "middle");
         const yStep = signalSetData.buckets[0].step;
         const rectHeight = this.yType === DataType.NUMBER ?
             yScale(0) - yScale(yStep) :
@@ -635,34 +626,17 @@ export class HeatmapChart extends Component {
             this.createChartCursor(signalSetData, xScale, yScale, rectHeight, rectWidth);
         }
 
-        this.defaultBrushLeft = [0, this.ySize];
-        this.overviewYScale = this.yType === DataType.NUMBER ?
-            d3Scale.scaleLinear().domain(this.yExtent).range([this.ySize, 0]) :
-            d3Scale.scaleBand().domain(this.yExtent).range([this.ySize, 0]);
-        this.defaultBrushBottom = [0, this.xSize];
-        this.overviewXScale = this.xType === DataType.NUMBER ? // keys
-            d3Scale.scaleLinear().domain(this.xExtent).range([0, this.xSize]) :
-            d3Scale.scaleBand().domain(this.xExtent).range([0, this.xSize]);
-        if (this.props.withOverviewLeft)
-            this.createChartOverviewLeft(this.state.rowProbs, this.overviewYScale, d3Color.color(this.props.overviewLeftColor || colors[colors.length - 1]));
-        if (this.props.withOverviewBottom)
-            this.createChartOverviewBottom(signalSetData.buckets, this.overviewXScale, d3Color.color(this.props.overviewBottomColor || colors[colors.length - 1]));
-
         // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
-        if (forceRefresh || widthChanged) {
-            this.createChartCursorArea(width, height);
+        if (forceRefresh) {
+            this.createChartCursorArea(xSize, ySize);
         }
-        if (this.props.withZoomX || this.props.withZoomY)
-            this.createChartZoom(xSize, ySize);
-        if (this.props.withOverviewLeft && this.props.withOverviewLeftBrush)
-            this.createChartOverviewLeftBrush();
-        if (this.props.withOverviewBottom && this.props.withOverviewBottomBrush)
-            this.createChartOverviewBottomBrush();
+
+        return RenderStatus.SUCCESS;
     }
 
     /** Prepares rectangle for cursor movement events.
      *  Called from this.createChart(). */
-    createChartCursorArea(width, height) {
+    createChartCursorArea(xSize, ySize) {
         this.cursorAreaSelection
             .selectAll('rect')
             .remove();
@@ -673,8 +647,8 @@ export class HeatmapChart extends Component {
             .attr('cursor', 'crosshair')
             .attr('x', 0)
             .attr('y', 0)
-            .attr('width', width - this.props.margin.left - this.props.margin.right)
-            .attr('height', height - this.props.margin.top - this.props.margin.bottom)
+            .attr('width', xSize)
+            .attr('height', ySize)
             .attr('visibility', 'hidden');
     }
 
@@ -685,9 +659,8 @@ export class HeatmapChart extends Component {
         let selection, mousePosition;
 
         const selectPoints = function () {
-            const containerPos = d3Selection.mouse(self.containerNode);
-            const x = containerPos[0] - self.props.margin.left;
-            const y = containerPos[1] - self.props.margin.top;
+            const containerPos = d3Selection.mouse(self.cursorAreaSelection.node());
+            const [x, y] = containerPos;
 
             let newSelectionColumn = null;
             for (const bucket of signalSetData.buckets) {
@@ -726,7 +699,7 @@ export class HeatmapChart extends Component {
             }
 
             selection = newSelection;
-            mousePosition = {x: containerPos[0], y: containerPos[1]};
+            mousePosition = { x, y};
 
             self.setState({
                 selection,
@@ -782,151 +755,12 @@ export class HeatmapChart extends Component {
             .remove();
     }
 
-    /** Handles zoom of the chart by user using d3-zoom.
-     *  Called from this.createChart(). */
-    createChartZoom(xSize, ySize) {
-        // noinspection DuplicatedCode
-        const self = this;
-
-        const handleZoom = function () {
-            if (self.ignoreZoomEvents) return;
-            // noinspection JSUnresolvedVariable
-            let newTransform = d3Event.transform;
-            let newZoomYScaleMultiplier = self.state.zoomYScaleMultiplier;
-            // check brush extents
-            const [newBrushBottom, newBrushLeft, updated] = self.getBrushValuesFromZoomValues(newTransform, newZoomYScaleMultiplier);
-            if (updated)
-                [newTransform, newZoomYScaleMultiplier] = self.getZoomValuesFromBrushValues(newBrushBottom, newBrushLeft);
-
-            // noinspection JSUnresolvedVariable
-            if (d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel" && self.props.withTransition) {
-                self.lastZoomCausedByUser = true;
-                self.ignoreZoomEvents = true;
-                transitionInterpolate(select(self), self.state.zoomTransform, newTransform, (t, y) => {
-                    setZoomTransform(self)(t, y);
-                    self.moveBrush(t, y || newZoomYScaleMultiplier); // sourceEvent is "wheel"
-                }, () => {
-                    self.ignoreZoomEvents = false;
-                    self.deselectPoints();
-                    setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
-                    if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
-                        self.zoom.transform(self.svgContainerSelection, newTransform);
-                    self.moveBrush(newTransform, newZoomYScaleMultiplier);
-                }, 150, self.state.zoomYScaleMultiplier, newZoomYScaleMultiplier);
-            } else {
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                    self.lastZoomCausedByUser = true;
-
-                setZoomTransform(self)(newTransform, newZoomYScaleMultiplier);
-                if (self.zoom && !AreZoomTransformsEqual(newTransform, d3Zoom.zoomTransform(self.svgContainerSelection.node())))
-                    self.zoom.transform(self.svgContainerSelection, newTransform);
-
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type === "brush" && (d3Event.sourceEvent.target === self.brushLeft || d3Event.sourceEvent.target === self.brushBottom)) return;
-                self.moveBrush(newTransform, newZoomYScaleMultiplier);
-            }
-        };
-
-        const handleZoomEnd = function () {
-            self.deselectPoints();
-            self.setState({
-                zoomInProgress: false
-            });
-        };
-        const handleZoomStart = function () {
-            self.setState({
-                zoomInProgress: true
-            });
-        };
-
-        const zoomExtent = [[0, 0], [xSize, ySize]];
-        const translateExtent = [[0, 0], [xSize, ySize * this.state.zoomYScaleMultiplier]];
-        let minZoom = Math.min(this.props.zoomLevelMin, this.props.zoomLevelMin / this.state.zoomYScaleMultiplier);
-        if (this.props.withZoomY && !this.props.withZoomX)
-            minZoom = this.props.zoomLevelMin / this.state.zoomYScaleMultiplier;
-        else if (!this.props.withZoomY && this.props.withZoomX)
-            minZoom = this.props.zoomLevelMin;
-
-        const zoomExisted = this.zoom !== null;
-        this.zoom = zoomExisted ? this.zoom : d3Zoom.zoom();
-        this.zoom
-            .scaleExtent([minZoom, this.props.zoomLevelMax])
-            .translateExtent(translateExtent)
-            .extent(zoomExtent)
-            .filter(() => {
-                // noinspection JSUnresolvedVariable
-                return !d3Selection.event.ctrlKey && !d3Selection.event.button && !this.state.brushInProgress;
-            })
-            .on("zoom", handleZoom)
-            .on("end", handleZoomEnd)
-            .on("start", handleZoomStart)
-            .interpolate(d3Interpolate.interpolate)
-            .wheelDelta(WheelDelta(2));
-        this.svgContainerSelection.call(this.zoom);
-        if (d3Zoom.zoomTransform(this.svgContainerSelection.node()).k < minZoom)
-            this.svgContainerSelection.call(this.zoom.scaleTo, this.props.zoomLevelMin);
-    }
-
-    /** Updates overview brushes from zoom transform values. */
-    moveBrush(transform, zoomYScaleMultiplier) {
-        if (!this.defaultBrushBottom || !this.defaultBrushLeft) // no data
-            return;
-        const [newBrushBottom, newBrushLeft, _] = this.getBrushValuesFromZoomValues(transform, zoomYScaleMultiplier);
-        if (newBrushBottom && this.brushBottom)
-            this.overviewBottomBrushSelection.call(this.brushBottom.move, newBrushBottom);
-        else
-            this.brushBottomValues = newBrushBottom;
-        if (newBrushLeft && this.brushLeft)
-            this.overviewLeftBrushSelection.call(this.brushLeft.move, newBrushLeft);
-        else
-            this.brushLeftValues = newBrushLeft;
-    };
-
-    getBrushValuesFromZoomValues(transform, zoomYScaleMultiplier) {
-        let updated = false;
-        let newBrushBottom = this.defaultBrushBottom.map(transform.invertX, transform);
-        const yTransform = transform.scale(zoomYScaleMultiplier);
-        let newBrushLeft = this.defaultBrushLeft.map(yTransform.invertY, yTransform);
-
-        if (this.props.withZoomX && this.props.withZoomY) {
-            if (newBrushBottom[0] < this.defaultBrushBottom[0]) {
-                newBrushBottom[0] = this.defaultBrushBottom[0];
-                updated = true;
-            }
-            if (newBrushBottom[1] > this.defaultBrushBottom[1]) {
-                newBrushBottom[1] = this.defaultBrushBottom[1];
-                updated = true;
-            }
-
-            if (newBrushLeft[0] < this.defaultBrushLeft[0]) {
-                newBrushLeft[0] = this.defaultBrushLeft[0];
-                updated = true;
-            }
-            if (newBrushLeft[1] > this.defaultBrushLeft[1]) {
-                newBrushLeft[1] = this.defaultBrushLeft[1];
-                updated = true;
-            }
-        }
-        else {
-            updated = true;
-            if (!this.props.withZoomX) {
-                newBrushBottom = this.brushBottomValues || this.defaultBrushBottom;
-            }
-            if (!this.props.withZoomY) {
-                newBrushLeft = this.brushLeftValues || this.defaultBrushLeft;
-            }
-        }
-        return [newBrushBottom, newBrushLeft, updated];
-    }
 
     /** Returns the current view (boundaries of visible region)
      * @return {{xMin, xMax, yMin, yMax }} left, right, bottom, top boundary (numbers or strings based on the type of data on each axis)
      */
     getView() {
-        const [xMin, xMax] = this.xScale.domain();
-        const [yMin, yMax] = this.yScale.domain();
-        return {xMin, xMax, yMin, yMax};
+        return this.base.getView();
     }
 
     /**
@@ -941,191 +775,40 @@ export class HeatmapChart extends Component {
     setView(xMin, xMax, yMin, yMax, source, causedByUser = false) {
         if (source === this || this.state.signalSetData === null)
             return;
-
-        if (xMin === undefined) xMin = this.xScale.domain()[0];
-        if (xMax === undefined) xMax = this.xType === DataType.NUMBER ? this.xScale.domain()[1] : this.xScale.domain()[this.xScale.domain().length - 1];
-        if (yMin === undefined) yMin = this.yScale.domain()[0];
-        if (yMax === undefined) yMax = this.yType === DataType.NUMBER ? this.yScale.domain()[1] : this.yScale.domain()[this.yScale.domain().length - 1];
-
-        if (this.overviewXScale(xMin) === undefined || this.overviewXScale(xMax) === undefined || this.overviewYScale(yMin) === undefined || this.overviewYScale(yMax) === undefined)
-            throw new Error("Parameters out of range.");
-
-        this.lastZoomCausedByUser = causedByUser;
-        this.setZoomToLimits(xMin, xMax, yMin, yMax);
+        if (this.base)
+            this.base.setView(xMin, xMax, yMin, yMax, source, causedByUser);
     }
 
-    /** Sets zoom object (transform) to desired view boundaries. If the axis data type is keyword (string), both boundary values are included. */
-    setZoomToLimits(xMin, xMax, yMin, yMax) {
-        if (this.xType === DataType.NUMBER)
-            this.brushBottomValues = [this.overviewXScale(xMin), this.overviewXScale(xMax)];
-        else
-            this.brushBottomValues = [this.overviewXScale(xMin), this.overviewXScale(xMax) + this.overviewXScale.bandwidth()];
-        if (this.yType === DataType.NUMBER)
-            this.brushLeftValues = [this.overviewYScale(yMax), this.overviewYScale(yMin)];
-        else
-            this.brushLeftValues = [this.overviewYScale(yMax), this.overviewYScale(yMin) + this.overviewYScale.bandwidth()];
-        this.updateZoomFromBrush();
-    }
+    /** Draws an additional histogram to the overview (see ZoomableChartBase.createChartOverviewY) to the left of the main chart
+     *  Called from ZoomableChartBase.createChart() */
+    createChartOverviewLeft(base, yScale, xSize, ySize) {
+        const rowProbs = this.state.rowProbs;
+        const colors = this.props.config.colors && this.props.config.colors.length >= 2 ? this.props.config.colors : HeatmapChart.defaultColors;
+        const barColor = d3Color.color(this.props.overviewLeftColor || colors[colors.length - 1]);
 
-    callViewChangeCallback() {
-        if (typeof(this.props.viewChangeCallback) !== "function")
-            return;
-
-        this.props.viewChangeCallback(this, this.getView(), this.lastZoomCausedByUser);
-    }
-
-    /** Creates histogram to the left of the main chart without zoom to enable zoom navigation by d3-brush
-     *  Called from this.createChart(). */
-    createChartOverviewLeft(rowProbs, yScale, barColor) {
-        //<editor-fold desc="Scales">
-        const xSize = this.props.overviewLeftWidth - this.props.overviewLeftMargin.left - this.props.overviewLeftMargin.right;
         const maxProb = d3Array.max(rowProbs, d => d.prob);
 
         const xScale = d3Scale.scaleLinear() // probabilities
             .domain([0, maxProb])
             .range([0, xSize]);
 
-        const yAxis = d3Axis.axisLeft(yScale)
-            .tickSizeOuter(0);
-        if (this.props.yAxisTicksCount) yAxis.ticks(this.props.yAxisTicksCount);
-        if (this.props.yAxisTicksFormat) yAxis.tickFormat(this.props.yAxisTicksFormat);
-        this.overviewLeftYAxisSelection.call(yAxis);
-        //</editor-fold>
-
         this.drawHorizontalBars(rowProbs, this.overviewLeftBarsSelection, yScale, xScale, barColor);
     }
 
-    /** Creates histogram below the main chart without zoom to enable zoom navigation by d3-brush
-     *  Called from this.createChart(). */
-    createChartOverviewBottom(colProbs, xScale, barColor) {
-        //<editor-fold desc="Scales">
-        const ySize = this.props.overviewBottomHeight - this.props.overviewBottomMargin.top - this.props.overviewBottomMargin.bottom;
+    /** Draws an additional histogram to the overview (see ZoomableChartBase.createChartOverviewX) below the main chart
+     *  Called from ZoomableChartBase.createChart() */
+    createChartOverviewBottom(base, xScale, xSize, ySize) {
+        const colProbs = this.state.signalSetData.buckets;
+        const colors = this.props.config.colors && this.props.config.colors.length >= 2 ? this.props.config.colors : HeatmapChart.defaultColors;
+        const barColor = d3Color.color(this.props.overviewLeftColor || colors[colors.length - 1]);
+
         const maxProb = d3Array.max(colProbs, d => d.prob);
 
         const yScale = d3Scale.scaleLinear() // probabilities
             .domain([0, maxProb])
             .range([ySize, 0]);
 
-        const xAxis = d3Axis.axisBottom(xScale)
-            .tickSizeOuter(0);
-        if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
-        if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
-        this.overviewBottomXAxisSelection.call(xAxis);
-        //</editor-fold>
-
         this.drawVerticalBars(colProbs, this.overviewBottomBarsSelection, xScale, yScale, barColor);
-    }
-
-    /** Creates d3-brush for left overview.
-     *  Called from this.createChart(). */
-    createChartOverviewLeftBrush() {
-        const self = this;
-
-        const xSize = this.props.overviewLeftWidth - this.props.overviewLeftMargin.left - this.props.overviewLeftMargin.right;
-        const brushExisted = this.brushLeft !== null;
-        this.brushLeft = brushExisted ? this.brushLeft : d3Brush.brushY();
-        this.brushLeft
-            .extent([[0, 0], [xSize, this.ySize]])
-            .handleSize(20)
-            .on("brush", function () {
-                // noinspection JSUnresolvedVariable
-                const sel = d3Event.selection;
-                self.overviewLeftBrushSelection.call(brushHandlesTopBottom, sel, xSize);
-                // noinspection JSUnresolvedVariable
-                self.brushLeftValues = d3Event.selection;
-
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type !== "zoom" && d3Event.sourceEvent.type !== "brush" && d3Event.sourceEvent.type !== "end") { // ignore brush by zoom
-                    if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                        self.lastZoomCausedByUser = true;
-                    self.updateZoomFromBrush();
-                }
-            });
-
-        this.overviewLeftBrushSelection
-            .attr('pointer-events', 'all')
-            .call(this.brushLeft);
-        if (!brushExisted)
-            this.overviewLeftBrushSelection.call(this.brushLeft.move, this.defaultBrushLeft);
-        // ensure that brush is not outside the extent
-        if (this.brushLeftValues && (this.brushLeftValues[0] < this.defaultBrushLeft[0] || this.brushLeftValues[1] > this.defaultBrushLeft[1]))
-            this.overviewLeftBrushSelection.call(this.brushLeft.move, [Math.max(this.brushLeftValues[0], this.defaultBrushLeft[0]), Math.min(this.brushLeftValues[1], this.defaultBrushLeft[1])]);
-        
-        this.overviewLeftBrushSelection.select(".selection")
-            .classed(styles.selection, true);
-        this.overviewLeftBrushSelection.select(".overlay")
-            .attr('pointer-events', 'none');
-    }
-
-    /** Creates d3-brush for bottom overview.
-     *  Called from this.createChart(). */
-    createChartOverviewBottomBrush() {
-        const self = this;
-
-        const ySize = this.props.overviewBottomHeight - this.props.overviewBottomMargin.top - this.props.overviewBottomMargin.bottom;
-        const brushExisted = this.brushBottom !== null;
-        this.brushBottom = brushExisted ? this.brushBottom : d3Brush.brushX();
-        this.brushBottom
-            .extent([[0, 0], [this.xSize, ySize]])
-            .handleSize(20)
-            .on("brush", function () {
-                // noinspection JSUnresolvedVariable
-                const sel = d3Event.selection;
-                self.overviewBottomBrushSelection.call(brushHandlesLeftRight, sel, ySize);
-                // noinspection JSUnresolvedVariable
-                self.brushBottomValues = d3Event.selection;
-
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && d3Event.sourceEvent.type !== "zoom" && d3Event.sourceEvent.type !== "brush" && d3Event.sourceEvent.type !== "end") { // ignore brush by zoom
-                    if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                        self.lastZoomCausedByUser = true;
-                    self.updateZoomFromBrush();
-                }
-            });
-
-        this.overviewBottomBrushSelection
-            .attr('pointer-events', 'all')
-            .call(this.brushBottom);
-        if (!brushExisted)
-            this.overviewBottomBrushSelection.call(this.brushBottom.move, this.defaultBrushBottom);
-        // ensure that brush is not outside the extent
-        if (this.brushBottomValues && (this.brushBottomValues[0] < this.defaultBrushBottom[0] || this.brushBottomValues[1] > this.defaultBrushBottom[1]))
-            this.overviewBottomBrushSelection.call(this.brushBottom.move, [Math.max(this.brushBottomValues[0], this.defaultBrushBottom[0]), Math.min(this.brushBottomValues[1], this.defaultBrushBottom[1])]);
-
-        this.overviewBottomBrushSelection.select(".selection")
-            .classed(styles.selection, true);
-        this.overviewBottomBrushSelection.select(".overlay")
-            .attr('pointer-events', 'none');
-    }
-
-    getZoomValuesFromBrushValues(bottom, left) {
-        if (!bottom) bottom = this.defaultBrushBottom;
-        if (!left) left = this.defaultBrushLeft;
-        const newXSize = bottom[1] - bottom[0];
-        const newYSize = left[1] - left[0];
-        const newXScaling = this.xSize / newXSize;
-        const newYScaling = this.ySize / newYSize;
-        const newZoomYScaleMultiplier = newYScaling / newXScaling;
-        const transform = d3Zoom.zoomIdentity.scale(newXScaling).translate(-bottom[0], -left[0] * newZoomYScaleMultiplier);
-        return [transform, newZoomYScaleMultiplier];
-    }
-
-    updateZoomFromBrush() {
-        const [transform, newZoomYScaleMultiplier] = this.getZoomValuesFromBrushValues(this.brushBottomValues, this.brushLeftValues);
-
-        this.setState({
-            zoomYScaleMultiplier: newZoomYScaleMultiplier
-        }, () => this.setZoom(transform, newZoomYScaleMultiplier));
-    }
-
-    /** Helper method to update zoom transform in state and zoom object. */
-    setZoom(transform, zoomYScaleMultiplier) {
-        if (this.zoom)
-            this.svgContainerSelection.call(this.zoom.transform, transform);
-        else {
-            this.setState({zoomTransform: transform});
-            this.moveBrush(transform, zoomYScaleMultiplier);
-        }
     }
 
     drawVerticalBars(data, barsSelection, keyScale, probScale, barColor) {
@@ -1168,104 +851,51 @@ export class HeatmapChart extends Component {
             .remove();
     }
 
-
     render() {
-        if (!this.state.signalSetData) {
-            return (
-                <svg ref={node => this.containerNode = node} height={this.props.height} width="100%"
-                     className={this.props.className} style={this.props.style} >
-                    <text textAnchor="middle" x="50%" y="50%"
-                          fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                        {this.state.statusMsg}
-                    </text>
-                </svg>
-            );
+        return (
+            <ZoomableChartBase
+                ref={node => this.base = node}
 
-        } else {
+                height={this.props.height}
+                margin={this.props.margin}
+                withOverviewX={this.props.withOverviewBottom}
+                withOverviewXBrush={this.props.withOverviewBottomBrush}
+                overviewXHeight={this.props.overviewBottomHeight}
+                overviewXMargin={this.props.overviewBottomMargin}
+                withOverviewY={this.props.withOverviewLeft}
+                withOverviewYBrush={this.props.withOverviewLeftBrush}
+                overviewYWidth={this.props.overviewLeftWidth}
+                overviewYMargin={this.props.overviewLeftMargin}
+                withTransition={this.props.withTransition}
+                withZoomX={this.props.withZoomX}
+                withZoomY={this.props.withZoomY}
+                withBrush={this.props.withBrush}
 
-            return (
-                <div className={this.props.className} style={this.props.style} >
-                    {this.props.withOverviewLeft &&
-                    <svg id="overview_left"
-                         height={this.props.height}
-                         width={this.props.overviewLeftWidth} >
-                        <g transform={`translate(${this.props.overviewLeftMargin.left}, ${this.props.margin.top})`}>
-                            <g ref={node => this.overviewLeftBarsSelection = select(node)}/>
-                        </g>
-                        <g ref={node => this.overviewLeftYAxisSelection = select(node)}
-                           transform={`translate(${this.props.overviewLeftMargin.left}, ${this.props.margin.top})`}/>
-                        <g ref={node => this.overviewLeftBrushSelection = select(node)}
-                           transform={`translate(${this.props.overviewLeftMargin.left}, ${this.props.margin.top})`}
-                           className={styles.brush}/>
-                    </svg>}
-                    <div ref={node => this.svgContainerSelection = select(node)} className={styles.touchActionNone}
-                         style={{ width: this.props.withOverviewLeft ? `calc(100% - ${this.props.overviewLeftWidth}px)` : "100%", height: this.props.height, display: "inline-block"}} >
-                        <svg id="cnt" ref={node => this.containerNode = node} height={"100%"} width={"100%"}>
-                            <defs>
-                                <clipPath id="plotRect">
-                                    <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.height - this.props.margin.top - this.props.margin.bottom} />
-                                </clipPath>
-                                <clipPath id="leftAxis">
-                                    <rect x={-this.props.margin.left + 1} y={0} width={this.props.margin.left} height={this.props.height - this.props.margin.top - this.props.margin.bottom + 6} /* 6 is default size of axis ticks, so we can add extra space in the bottom left corner for this axis and still don't collide with the other axis. Thanks to this, the first tick text should not be cut in half. */ />
-                                </clipPath>
-                                <clipPath id="bottomAxis">
-                                    <rect x={-6} y={0} width={this.state.width - this.props.margin.left - this.props.margin.right + 6} height={this.props.margin.bottom} /* same reason for 6 as above */ />
-                                </clipPath>
-                            </defs>
-                            <g transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" >
-                                <g ref={node => this.columnsSelection = select(node)}/>
-                                {!this.state.zoomInProgress &&
-                                    <g ref={node => this.highlightSelection = select(node)}/>}
-                            </g>
+                getXScale={::this.getXScale}
+                getYScale={::this.getYScale}
+                statusMsg={this.state.statusMsg}
 
-                            {/* axes */}
-                            <g ref={node => this.xAxisSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.height - this.props.margin.bottom})`}
-                               clipPath="url(#bottomAxis)" />
-                            <text ref={node => this.xAxisLabelSelection = select(node)}
-                                  transform={`translate(${this.props.margin.left + (this.state.width - this.props.margin.left - this.props.margin.right) / 2}, ${this.props.height - 5})`} />
-                            <g ref={node => this.yAxisSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}
-                               clipPath="url(#leftAxis)"/>
-                            <text ref={node => this.yAxisLabelSelection = select(node)}
-                                  transform={`translate(${15}, ${this.props.margin.top + (this.props.height - this.props.margin.top - this.props.margin.bottom) / 2}) rotate(-90)`} />
+                createChart={::this.createChart}
+                createChartOverviewX={::this.createChartOverviewBottom}
+                createChartOverviewY={::this.createChartOverviewLeft}
+                getGraphContent={::this.getGraphContent}
+                getOverviewXContent={::this.getOverviewXContent}
+                getOverviewYContent={::this.getOverviewYContent}
+                onZoomEnd={::this.deselectPoints}
 
-                            <text textAnchor="middle" x="50%" y="50%"
-                                  fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                                {this.state.statusMsg}
-                            </text>
-                            {this.props.withTooltip && !this.state.zoomInProgress &&
-                            <Tooltip
-                                config={this.props.config}
-                                signalSetsData={this.state.signalSetData}
-                                containerHeight={this.props.height}
-                                containerWidth={this.state.width}
-                                mousePosition={this.state.mousePosition}
-                                selection={this.state.selection}
-                                contentRender={props => <TooltipContent {...props} tooltipFormat={this.props.tooltipFormat}/>}
-                                width={250}
-                            />
-                            }
-                            <g ref={node => this.cursorAreaSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
-                        </svg>
-                    </div>
-                    {this.props.withOverviewBottom &&
-                    <svg id="overview_bottom"
-                         style={{marginLeft: this.props.withOverviewLeft ? this.props.overviewLeftWidth : 0}}
-                         height={this.props.overviewBottomHeight}
-                         width={ this.props.withOverviewLeft ? `calc(100% - ${this.props.overviewLeftWidth}px)` : "100%"} >
-                        <g transform={`translate(${this.props.margin.left}, ${this.props.overviewBottomMargin.top})`}>
-                            <g ref={node => this.overviewBottomBarsSelection = select(node)}/>
-                        </g>
-                        <g ref={node => this.overviewBottomXAxisSelection = select(node)}
-                           transform={`translate(${this.props.margin.left}, ${this.props.overviewBottomHeight - this.props.overviewBottomMargin.bottom})`}/>
-                        <g ref={node => this.overviewBottomBrushSelection = select(node)}
-                           transform={`translate(${this.props.margin.left}, ${this.props.overviewBottomMargin.top})`}
-                           className={styles.brush}/>
-                    </svg>}
-                </div>
-            );
-        }
+                xAxisTicksCount={this.props.xAxisTicksCount}
+                xAxisTicksFormat={this.props.xAxisTicksFormat}
+                xAxisLabel={this.props.xAxisLabel}
+                yAxisTicksCount={this.props.yAxisTicksCount}
+                yAxisTicksFormat={this.props.yAxisTicksFormat}
+                yAxisLabel={this.props.yAxisLabel}
+
+                viewChangeCallback={this.props.viewChangeCallback}
+                zoomLevelMin={this.props.zoomLevelMin}
+                zoomLevelMax={this.props.zoomLevelMax}
+                className={this.props.className}
+                style={this.props.style}
+            />
+        );
     }
 }

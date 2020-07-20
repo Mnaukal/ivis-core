@@ -17,6 +17,7 @@ import {withTranslation} from "../lib/i18n";
 import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
 import {
+    AreZoomTransformsEqual,
     isInExtent,
     RenderStatus,
 } from "./common";
@@ -256,7 +257,7 @@ export class HistogramChart extends Component {
                     filter.children.push(this.props.filter);
 
                 // filter by current zoom
-                if (!Object.is(zoomTransform, d3Zoom.zoomIdentity)) {
+                if (!AreZoomTransformsEqual(zoomTransform, d3Zoom.zoomIdentity)) {
                     const scale = zoomTransform.k;
                     if (minStep !== undefined)
                         minStep = Math.floor(minStep / scale);
