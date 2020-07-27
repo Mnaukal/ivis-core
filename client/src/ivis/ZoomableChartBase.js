@@ -27,7 +27,7 @@ import {set} from "immutable";
 @withComponentMixins([
     withTranslation,
     withErrorHandling
-], ["getView", "setView", "getXZoomTransform", "getYZoomTransform", "resetZoom", "createChart", "resetChart", "callViewChangeCallback", "setBrushEnabled"])
+], ["getView", "setView", "getXZoomTransform", "getYZoomTransform", "resetZoom", "createChart", "resetChart", "callViewChangeCallback", "setBrushEnabled", "zoomIn", "zoomOut", "getState"])
 export class ZoomableChartBase extends Component {
     constructor(props){
         super(props);
@@ -36,6 +36,7 @@ export class ZoomableChartBase extends Component {
             zoomTransform: d3Zoom.zoomIdentity,
             zoomYScaleMultiplier: 1,
             width: 0,
+            zoomInProgress: false,
             brushInProgress: false,
         };
 
@@ -88,9 +89,12 @@ export class ZoomableChartBase extends Component {
         getOverviewSvgDefs: PropTypes.func, // getOverviewSvgDefs(base, original_xScale, xSize, overview_ySize)
         rerenderAfterCreateChart: PropTypes.bool, // if getGraphContent is used to draw the chart, set this to true to force rendering after the scales are updated - by default, React first calls render (which calls getGraphContent) and then componentDidUpdate (which calls createChart); setting this to true will force React to call render again after createChart; if the chart is drawn in createChart, keep this to false
 
-        onZoomStart: PropTypes.func,
-        onZoom: PropTypes.func,
-        onZoomEnd: PropTypes.func,
+        onZoomStart: PropTypes.func, // called when "start" event is called on the d3Zoom object
+        onZoom: PropTypes.func, // called when "zoom" event is called on the d3Zoom object
+        onZoomEnd: PropTypes.func, // called when "end" event is called on the d3Zoom object
+        onBrushEnabled: PropTypes.func, // called when brush (in the main chart area, not in overviews) is enabled (true) or disabled (false);
+        onBrush: PropTypes.func, // called when brush is finished (the user releases the mouse button after drawing a rectangle; the zoom transition to the selected region starts now)
+        onBrushEnd: PropTypes.func, // called when the animation to zoom to region selected brush finishes
 
         xAxisTicksCount: PropTypes.number,
         xAxisTicksFormat: PropTypes.func,
@@ -164,6 +168,8 @@ export class ZoomableChartBase extends Component {
         window.removeEventListener('keydown', ::this.keydownListener);
         window.removeEventListener('keyup', ::this.keyupListener);
     }
+
+    getState = () => this.state;
 
     /** Creates (or updates) the chart with current data.
      * This method is called from componentDidUpdate automatically when state or config is updated or can be called from outside (from the component which is built on this base class).
@@ -308,7 +314,7 @@ export class ZoomableChartBase extends Component {
      * @return {{xMin, xMax, yMin, yMax }} left, right, bottom, top boundary (numbers or strings based on the type of data on each axis)
      */
     getView() {
-        const [xMin, xMax] = this.xScale.domain(); // TODO band scale
+        const [xMin, xMax] = this.xScale.domain(); // TODO band scale, noData
         const [yMin, yMax] = this.yScale.domain();
         return {xMin, xMax, yMin, yMax};
     }
@@ -331,7 +337,7 @@ export class ZoomableChartBase extends Component {
         if (yMin === undefined) yMin = this.yScale.domain()[0];
         if (yMax === undefined) yMax = this.yScale.domain()[1];
 
-        if (this.overviewXScale(xMin) === undefined || this.overviewXScale(xMax) === undefined || this.overviewYScale(yMin) === undefined || this.overviewYScale(yMax) === undefined)
+        if (this.originalXScale(xMin) === undefined || this.originalXScale(xMax) === undefined || this.originalYScale(yMin) === undefined || this.originalYScale(yMax) === undefined)
             throw new Error("Parameters out of range.");
 
         this.lastZoomCausedByUser = causedByUser;
@@ -341,20 +347,37 @@ export class ZoomableChartBase extends Component {
     /**
      * Resets the visible region of the chart to the initial
      * @param causedByUser  tells whether the view update was caused by user (this propagates to props.viewChangeCallback call), default = false
+     * @param withTransition  when set to true, the zoom update is animated
      */
-    resetZoom(causedByUser = false) {
+    resetZoom(causedByUser = false, withTransition = false) {
         this.lastZoomCausedByUser = causedByUser;
-        // first set state so that this.getXZoomTransform and this.getYZoomTransform return correct values
-        this.setState({
-            zoomTransform: d3Zoom.zoomIdentity,
-            zoomYScaleMultiplier: 1
-        }, () => {
-            // reset brushes and zoom object
-            this.brushXValues = this.defaultBrushX;
-            this.brushYValues = this.defaultBrushY;
-            this.updateZoomFromBrush();
-        })
+        if (withTransition)
+            this.setZoom(d3Zoom.zoomIdentity, 1, true);
+        else {
+            // first set state so that this.getXZoomTransform and this.getYZoomTransform return correct values
+            this.setState({
+                zoomTransform: d3Zoom.zoomIdentity,
+                zoomYScaleMultiplier: 1
+            }, () => {
+                // reset brushes and zoom object
+                this.brushXValues = this.defaultBrushX;
+                this.brushYValues = this.defaultBrushY;
+                this.updateZoomFromBrush();
+            });
+        }
     }
+
+    zoomIn(causedByUser = true) {
+        this.lastZoomCausedByUser = causedByUser;
+        // TODO
+        this.svgContainerSelection.transition().call(this.zoom.scaleBy, this.props.zoomLevelStepFactor);
+    };
+
+    zoomOut(causedByUser = true) {
+        this.lastZoomCausedByUser = causedByUser;
+        // TODO
+        this.svgContainerSelection.transition().call(this.zoom.scaleBy, 1.0 / this.props.zoomLevelStepFactor);
+    };
 
     /**
      * Calls the props.viewChangeCallback method
@@ -483,7 +506,14 @@ export class ZoomableChartBase extends Component {
     }
 
     /** Sets zoom object (transform) to desired view boundaries (in units of data). If the axis data type is keyword (string), both boundary values are included. */
-    setZoomToLimits(xMin, xMax, yMin, yMax) { // TODO
+    setZoomToLimits(xMin, xMax, yMin, yMax) {
+        this.brushXValues = [this.originalXScale(xMin), this.originalXScale(xMax)];
+        this.brushYValues = [this.originalYScale(yMax), this.originalYScale(yMin)];
+        this.updateZoomFromBrush();
+
+        return;
+        // TODO other types of scales (band)
+
         if (this.xType === DataType.NUMBER)
             this.brushXValues = [this.originalXScale(xMin), this.originalXScale(xMax)];
         else
@@ -718,8 +748,11 @@ export class ZoomableChartBase extends Component {
     }
 
     setBrushEnabled(enabled) {
-        if (this.state.brushInProgress !== enabled)
-            this.setState({ brushInProgress: enabled });
+        if (this.state.brushInProgress !== enabled) {
+            this.setState({brushInProgress: enabled});
+            if (typeof this.props.onBrushEnabled === "function")
+                this.props.onBrushEnabled(enabled);
+        }
     }
 
     /** Prepares the d3 brush for region selection.
@@ -761,9 +794,22 @@ export class ZoomableChartBase extends Component {
                             self.brushYValues = newBrushY;
                             self.updateZoomFromBrush();
                             self.setState({
-                                brushInProgress: false,
                                 zoomInProgress: false
                             });
+                            self.setBrushEnabled(false);
+                            self.lastZoomCausedByUser = true;
+                            self.callViewChangeCallback();
+                            if (typeof self.props.onBrushEnd === "function")
+                                self.props.onBrushEnd();
+                        }
+
+                        if (typeof self.props.onBrush === "function") {
+                            let xMin, xMax, yMin, yMax;
+                            if (typeof self.xScale.invert === "function") xMin = self.xScale.invert(x0);
+                            if (typeof self.xScale.invert === "function") xMax = self.xScale.invert(x1);
+                            if (typeof self.yScale.invert === "function") yMin = self.yScale.invert(y1);
+                            if (typeof self.yScale.invert === "function") yMax = self.yScale.invert(y0);
+                            self.props.onBrush(xMin, xMax, yMin, yMax);
                         }
 
                         if (self.props.withTransition) {

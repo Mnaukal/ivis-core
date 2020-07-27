@@ -17,7 +17,7 @@ import {withTranslation} from "../lib/i18n";
 import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
 import {
-    AreZoomTransformsEqual,
+    AreZoomTransformsEqual, createChartCursorArea,
     getColorScale, RenderStatus,
 } from "./common";
 import {PropType_d3Color} from "../lib/CustomPropTypes";
@@ -122,10 +122,6 @@ export class HeatmapChart extends Component {
 
         this.xExtent = [0, 0];
         this.yExtent = [0, 0];
-
-        this.resizeListener = () => {
-            this.createChart(true);
-        };
     }
 
     static propTypes = {
@@ -217,11 +213,6 @@ export class HeatmapChart extends Component {
     };
     static defaultColors = ["#ffffff", "#1c70ff"]; // default value for props.config.colors
 
-    componentDidMount() {
-        window.addEventListener('resize', this.resizeListener);
-        this.createChart(false, false);
-    }
-
     /** Update and redraw the chart based on changes in React props and state */
     componentDidUpdate(prevProps, prevState) {
         const t = this.props.t;
@@ -251,7 +242,7 @@ export class HeatmapChart extends Component {
         }
 
         if (configDiff === ConfigDifference.DATA_WITH_CLEAR) {
-            this.base.resetZoom(true);
+            this.base.resetZoom(/* causedByUser: */ true);
             this.setState({
                 statusMsg: t('Loading...')
             }, () => {
@@ -268,10 +259,6 @@ export class HeatmapChart extends Component {
 
             this.base.createChart(forceRefresh, false);
         }
-    }
-
-    componentWillUnmount() {
-        window.removeEventListener('resize', this.resizeListener);
     }
 
     /** Fetches new data for the chart, processes the results using this.prepareData method and updates the state accordingly, so the chart is redrawn */
@@ -627,29 +614,10 @@ export class HeatmapChart extends Component {
         }
 
         // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
-        if (forceRefresh) {
-            this.createChartCursorArea(xSize, ySize);
-        }
+        if (forceRefresh)
+            createChartCursorArea(this.cursorAreaSelection, xSize, ySize);
 
         return RenderStatus.SUCCESS;
-    }
-
-    /** Prepares rectangle for cursor movement events.
-     *  Called from this.createChart(). */
-    createChartCursorArea(xSize, ySize) {
-        this.cursorAreaSelection
-            .selectAll('rect')
-            .remove();
-
-        this.cursorAreaSelection
-            .append('rect')
-            .attr('pointer-events', 'all')
-            .attr('cursor', 'crosshair')
-            .attr('x', 0)
-            .attr('y', 0)
-            .attr('width', xSize)
-            .attr('height', ySize)
-            .attr('visibility', 'hidden');
     }
 
     /** Handles mouse movement to select the bin (for displaying its details in Tooltip, etc.).
@@ -760,7 +728,8 @@ export class HeatmapChart extends Component {
      * @return {{xMin, xMax, yMin, yMax }} left, right, bottom, top boundary (numbers or strings based on the type of data on each axis)
      */
     getView() {
-        return this.base.getView();
+        if (this.base)
+            return this.base.getView();
     }
 
     /**

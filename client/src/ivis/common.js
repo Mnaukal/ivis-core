@@ -151,6 +151,23 @@ export function AreZoomTransformsEqual(a, b, scale_epsilon = 0.001, translate_ep
     return true;
 }
 
+/** Prepares the rectangle for cursor movement events. */
+export function createChartCursorArea(selection, xSize, ySize) {
+    selection
+        .selectAll('rect')
+        .remove();
+
+    selection
+        .append('rect')
+        .attr('pointer-events', 'all')
+        .attr('cursor', 'crosshair')
+        .attr('x', 0)
+        .attr('y', 0)
+        .attr('width', xSize)
+        .attr('height', ySize)
+        .attr('visibility', 'hidden');
+}
+
 export const RenderStatus = {
     SUCCESS: 0,
     NO_DATA: 1

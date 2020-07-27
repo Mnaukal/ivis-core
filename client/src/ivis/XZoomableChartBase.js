@@ -313,8 +313,8 @@ export class XZoomableChartBase extends Component {
 
     /** Sets zoom object (transform) to desired view boundaries. */
     setZoomToLimits(xMin, xMax) { // TODO non-numerical signals
-        if (this.brush) {
-            this.overviewBrushSelection.call(this.brush.move, [this.originalXScale(xMin), this.originalXScale(xMax)]);
+        if (this.brushX) {
+            this.overviewBrushSelection.call(this.brushX.move, [this.originalXScale(xMin), this.originalXScale(xMax)]);
             // brush will also adjust zoom if sourceEvent is not "zoom" caused by this.zoom which is true when this method is called from this.setView
         }
         else {

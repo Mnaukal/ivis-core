@@ -17,7 +17,7 @@ import {withTranslation} from "../lib/i18n";
 import {Tooltip} from "./Tooltip";
 import {Icon} from "../lib/bootstrap-components";
 import {
-    AreZoomTransformsEqual,
+    AreZoomTransformsEqual, createChartCursorArea,
     isInExtent,
     RenderStatus,
 } from "./common";
@@ -167,10 +167,6 @@ export class HistogramChart extends Component {
         overviewHeight: 100,
         overviewMargin: { top: 20, bottom: 20 }
     };
-
-    componentDidMount() {
-        this.base.createChart(false, false);
-    }
 
     /** Update and redraw the chart based on changes in React props and state */
     componentDidUpdate(prevProps, prevState) {
@@ -445,7 +441,7 @@ export class HistogramChart extends Component {
 
         // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
         if (forceRefresh)
-            this.createChartCursorArea(xSize, ySize);
+            createChartCursorArea(this.cursorAreaSelection, xSize, ySize);
 
         this.createChartCursor(signalSetData, xScale, yScale, xSize, ySize);
 
@@ -482,24 +478,6 @@ export class HistogramChart extends Component {
 
         bars.exit()
             .remove();
-    }
-
-    /** Prepares the rectangle for cursor movement events.
-     *  Called from this.createChart(). */
-    createChartCursorArea(xSize, ySize) {
-        this.cursorAreaSelection
-            .selectAll('rect')
-            .remove();
-
-        this.cursorAreaSelection
-            .append('rect')
-            .attr('pointer-events', 'all')
-            .attr('cursor', 'crosshair')
-            .attr('x', 0)
-            .attr('y', 0)
-            .attr('width', xSize)
-            .attr('height', ySize)
-            .attr('visibility', 'hidden');
     }
 
     /** Handles mouse movement to select the closest bar (for displaying its details in Tooltip, etc.).
@@ -546,8 +524,8 @@ export class HistogramChart extends Component {
             self.cursorSelection
                 .attr('y1', 0)
                 .attr('y2', ySize)
-                .attr('x1', containerPos[0])
-                .attr('x2', containerPos[0])
+                .attr('x1', x)
+                .attr('x2', x)
                 .attr('visibility', self.props.withCursor ? 'visible' : "hidden");
 
             selection = newSelection;
@@ -583,7 +561,8 @@ export class HistogramChart extends Component {
      * @return {{xMin: number, xMax: number }} left, right boundary
      */
     getView() {
-        return this.base.getView();
+        if (this.base)
+            return this.base.getView();
     }
 
     /**

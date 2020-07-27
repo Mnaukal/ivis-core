@@ -24,10 +24,24 @@ import {Tooltip} from "./Tooltip";
 import {Button, CheckBox, Form, InputField, withForm} from "../lib/form";
 import styles from "./CorrelationCharts.scss";
 import {ActionLink, Icon} from "../lib/bootstrap-components";
-import {distance, extentWithMargin, getColorScale, getExtent, isInExtent, isSignalVisible, ModifyColorCopy, setZoomTransform, transitionInterpolate, WheelDelta, ZoomEventSources} from "./common";
+import {
+    AreZoomTransformsEqual, createChartCursorArea,
+    distance,
+    extentWithMargin,
+    getColorScale,
+    getExtent,
+    isInExtent,
+    isSignalVisible,
+    ModifyColorCopy, RenderStatus,
+    setZoomTransform,
+    transitionInterpolate,
+    WheelDelta,
+    ZoomEventSources
+} from "./common";
 import {PropType_d3Color_Required} from "../lib/CustomPropTypes";
 import {dotShapes, dotShapeNames} from "./dot_shapes";
 import {withPageHelpers} from "../lib/page-common";
+import {ZoomableChartBase} from "./ZoomableChartBase";
 
 const ConfigDifference = {
     NONE: 0,
@@ -317,34 +331,24 @@ export class ScatterPlotBase extends Component {
 
         const t = props.t;
         this.dataAccessSession = new DataAccessSession();
-        this.resizeListener = () => {
-            this.createChart();
-        };
         /** labels used for Tooltip */
         this.labels = {};
         this.globalRegressions = [];
         this.regressions = [];
-        this.lastZoomCausedByUser = false;
-
-        this.zoom = null;
 
         this.state = {
             signalSetsData: null, // data from last request
             globalSignalSetsData: null, // data from request without range filters (completely zoomed out)
             statusMsg: t('Loading...'),
-            width: 0,
             selections: null,
-            zoomTransform: d3Zoom.zoomIdentity,
-            zoomYScaleMultiplier: 1,
-            zoomInProgress: false,
-            brushInProgress: false,
             xMin: props.xMinValue,
             xMax: props.xMaxValue,
             yMin: props.yMinValue,
             yMax: props.yMaxValue,
             withTooltip: props.withTooltip,
             maxDotCount: props.maxDotCount,
-            noData: true
+            noData: true,
+            brushInProgress: false,
         };
     }
 
@@ -483,21 +487,8 @@ export class ScatterPlotBase extends Component {
     static defaultGetGlobalDotColor = color => { color.opacity *= 0.5; return color; };
 
     componentDidMount() {
-        window.addEventListener('resize', this.resizeListener);
-        window.addEventListener('keydown', ::this.keydownListener);
-        window.addEventListener('keyup', ::this.keyupListener);
-        this.createChart(false);
         // noinspection JSIgnoredPromiseFromCall
         this.fetchData();
-    }
-
-    keydownListener(event) {
-        if (event.key === "Control" && !this.state.brushInProgress)
-            this.setState({brushInProgress: true});
-    }
-    keyupListener(event) {
-        if (event.key === "Control" && this.state.brushInProgress && !this.state.zoomInProgress)
-            this.setState({brushInProgress: false});
     }
 
     /** Update and redraw the chart based on changes in React props and state */
@@ -531,7 +522,7 @@ export class ScatterPlotBase extends Component {
 
         if (configDiff === ConfigDifference.DATA_WITH_CLEAR)
         {
-            this.resetZoom(false, false);
+            this.base.resetZoom(/* causedByUser: */ true);
             this.setState({
                 xMin: this.props.xMinValue,
                 xMax: this.props.xMaxValue,
@@ -545,26 +536,12 @@ export class ScatterPlotBase extends Component {
             this.fetchData();
         }
         else {
-            const forceRefresh = this.prevContainerNode !== this.containerNode
-                || prevState.signalSetsData !== this.state.signalSetsData
+            const forceRefresh = prevState.signalSetsData !== this.state.signalSetsData
                 || prevState.globalSignalSetsData !== this.state.globalSignalSetsData
-                || prevState.brushInProgress !== this.state.brushInProgress
-                || prevState.zoomYScaleMultiplier !== this.state.zoomYScaleMultiplier // update zoom extent
                 || configDiff !== ConfigDifference.NONE;
 
-            const updateZoom = !Object.is(prevState.zoomTransform, this.state.zoomTransform);
-
-            this.createChart(forceRefresh, updateZoom);
-            this.prevContainerNode = this.containerNode;
-            if (updateZoom)
-                this.callViewChangeCallback();
+            this.base.createChart(forceRefresh, false);
         }
-    }
-
-    componentWillUnmount() {
-        window.removeEventListener('resize', this.resizeListener);
-        window.removeEventListener('keydown', ::this.keydownListener);
-        window.removeEventListener('keyup', ::this.keyupListener);
     }
     //</editor-fold>
 
@@ -590,10 +567,9 @@ export class ScatterPlotBase extends Component {
         const additionalInformation = [];
 
         // update limits with current zoom - check if zoomTransform is almost equal to identity
-        if (Math.abs(self.state.zoomTransform.k - 1) > 0.01 ||
-            Math.abs(self.state.zoomYScaleMultiplier - 1) > 0.01 ||
-            Math.abs(self.state.zoomTransform.x) > 3 ||
-            Math.abs(self.state.zoomTransform.y) > 3) {
+        const zoomTransformX = self.base.getXZoomTransform();
+        const zoomTransformY = self.base.getYZoomTransform();
+        if (!AreZoomTransformsEqual(zoomTransformX, d3Zoom.zoomIdentity, 0.01, 3) || !AreZoomTransformsEqual(zoomTransformY, d3Zoom.zoomIdentity, 0.01, 3))  {
 
             isZoomedIn = true;
 
@@ -782,19 +758,17 @@ export class ScatterPlotBase extends Component {
                 this.setState(newState, () => {
                     if (updateGlobals)
                         // call callViewChangeCallback when data new data without range filter are loaded as the xExtent might got updated (even though this.state.zoomTransform is the same)
-                        this.callViewChangeCallback();
+                        this.base.callViewChangeCallback();
                 });
 
-                if (updateGlobals && newState.noData === true) {
-                    this.clearChart();
+                if (updateGlobals && newState.noData === true)
                     return;
-                }
 
                 if (updateGlobals) { // zoomed completely out
                     this.globalRegressions = await this.createRegressions(newState.signalSetsData);
                 }
                 this.regressions = await this.createRegressions(newState.signalSetsData);
-                this.createChart(true);
+                this.base.createChart(true);
             }
         } catch (err) {
             this.setState({statusMsg: this.props.t("Error loading data.")});
@@ -957,60 +931,43 @@ export class ScatterPlotBase extends Component {
         return [xExtent, yExtent, sExtent, cExtent, cExtents, dExtent, dExtents];
     }
 
+    /** gets current xScale based on xType */
+    getXScale(range) {
+        if (!this.state.signalSetsData) return null;
+
+        return d3Scale.scaleLinear()
+            .domain(this.xExtent)
+            .range(range);
+    }
+
+    /** gets current yScale based on yType */
+    getYScale(range) {
+        if (!this.state.signalSetsData) return null;
+
+        return d3Scale.scaleLinear()
+            .domain(this.yExtent)
+            .range(range);
+    }
+
     /** Creates (or updates) the chart with current data.
      * This method is called from componentDidUpdate automatically when state or config is updated.
      * All the 'createChart*' methods are called from here. */
-    createChart(forceRefresh, updateZoom) {
+    createChart(base, forceRefresh, updateZoom, xScale, yScale, xSize, ySize) {
         /** @description last data loaded by fetchData */
         const signalSetsData = this.state.signalSetsData;
         /** @description data loaded when chart was completely zoomed out */
         const globalSignalSetsData = this.state.globalSignalSetsData;
 
-        const width = this.containerNode.getClientRects()[0].width;
-        if (this.state.width !== width) {
-            this.setState({
-                width
-            });
-        }
-        const widthChanged = width !== this.renderedWidth;
-        if (!forceRefresh && !widthChanged && !updateZoom) {
-            return;
-        }
-        this.renderedWidth = width;
-
         if (!signalSetsData || !globalSignalSetsData) {
-            return;
+            return RenderStatus.NO_DATA;
+        }
+        if (!forceRefresh && !updateZoom) {
+            return RenderStatus.SUCCESS;
         }
 
         this.updateLabels();
 
-        const ySize = this.props.height - this.props.margin.top - this.props.margin.bottom;
-        const xSize = width - this.props.margin.left - this.props.margin.right;
         const SignalSetsConfigs = this.props.config.signalSets;
-
-        //<editor-fold desc="X and Y Scales">
-        // y Scale
-        const yScale = this.state.zoomTransform.scale(this.state.zoomYScaleMultiplier).rescaleY(d3Scale.scaleLinear()
-            .domain(this.yExtent)
-            .range([ySize, 0]));
-        this.yScale = yScale;
-        const yAxis = d3Axis.axisLeft(yScale);
-        if (this.props.yAxisTicksCount) yAxis.ticks(this.props.yAxisTicksCount);
-        if (this.props.yAxisTicksFormat) yAxis.tickFormat(this.props.yAxisTicksFormat);
-        this.yAxisSelection.call(yAxis);
-        this.yAxisLabelSelection.text(this.props.yAxisLabel).style("text-anchor", "middle");
-
-        // x Scale
-        const xScale = this.state.zoomTransform.rescaleX(d3Scale.scaleLinear()
-            .domain(this.xExtent)
-            .range([0, xSize]));
-        this.xScale = xScale;
-        const xAxis = d3Axis.axisBottom(xScale);
-        if (this.props.xAxisTicksCount) xAxis.ticks(this.props.xAxisTicksCount);
-        if (this.props.xAxisTicksFormat) xAxis.tickFormat(this.props.xAxisTicksFormat);
-        this.xAxisSelection.call(xAxis);
-        this.xAxisLabelSelection.text(this.props.xAxisLabel).style("text-anchor", "middle");
-        //</editor-fold>
 
         // data filtering
         const filterData = this.props.filterData || ScatterPlotBase.filterData;
@@ -1076,27 +1033,13 @@ export class ScatterPlotBase extends Component {
         drawChart(this, filteredData, filteredGlobalData, xScale, yScale, sScale, cScales);
         this.drawRegressions(xScale, yScale, cScales);
 
-        this.createChartCursor(xScale, yScale, sScale, cScales, filteredData);
+        this.createChartCursor(filteredData, xScale, yScale, sScale, cScales, xSize, ySize);
 
-        // we don't want to change brush and zoom when updating only zoom (it breaks touch drag)
-        if (forceRefresh || widthChanged) {
-            this.createChartBrush();
-            if (this.props.withZoom)
-                this.createChartZoom(xSize, ySize);
-        }
-    }
+        // we don't want to change the cursor area when updating only zoom (it breaks touch drag)
+        if (forceRefresh)
+            createChartCursorArea(this.cursorAreaSelection, xSize, ySize);
 
-    /** Resets chart's zoom, brush, etc.
-     * Should only be called when setting state to noData or similar situation, i.e. no data are rendered */
-    clearChart() {
-        this.brushParentSelection
-            .on('mouseenter', null)
-            .on('mousemove', null)
-            .on('mouseleave', null);
-
-        this.zoom = null;
-        this.globalRegressions = [];
-        this.regressions = [];
+        return RenderStatus.SUCCESS;
     }
 
     //<editor-fold desc="Data processing">
@@ -1193,6 +1136,69 @@ export class ScatterPlotBase extends Component {
     //</editor-fold>
 
     //<editor-fold desc="Data drawing">
+    getGraphContent(base, xScale, yScale, xSize, ySize) {
+        this.dotHighlightSelections = {};
+        const dotsHighlightSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
+            <g key={signalSet.cid + "-" + i}
+               ref={node => this.dotHighlightSelections[signalSet.cid + "-" + i] = select(node)}/>
+        );
+
+        this.dotsSelection = {};
+        const dotsSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
+            <g key={signalSet.cid + "-" + i}
+               ref={node => this.dotsSelection[signalSet.cid + "-" + i] = select(node)}/>
+        );
+
+        this.dotsGlobalSelection = {};
+        const dotsGlobalSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
+            <g key={signalSet.cid + "-" + i}
+               ref={node => this.dotsGlobalSelection[signalSet.cid + "-" + i] = select(node)}/>
+        );
+
+        return (<>
+            <g name={"regressions"} ref={node => this.regressionsSelection = select(node)}/>
+            <g name={"dots_global"}>{dotsGlobalSelectionGroups}</g>
+            <g name={"dots"}>{dotsSelectionGroups}</g>
+            <g name={"highlightDots"} visibility={(this.props.withCursor || this.state.withTooltip) && !base.state.zoomInProgress ? "visible" : "hidden"} >{dotsHighlightSelectionGroups}</g>
+
+            {/* cursor lines */}
+            {!base.state.zoomInProgress && !base.state.brushInProgress &&
+            <line ref={node => this.cursorSelectionX = select(node)} strokeWidth="1"
+                  stroke="rgb(50,50,50)"
+                  visibility="hidden"/> }
+            {!base.state.zoomInProgress && !base.state.brushInProgress &&
+            <line ref={node => this.cursorSelectionY = select(node)} strokeWidth="1"
+                  stroke="rgb(50,50,50)"
+                  visibility="hidden"/> }
+
+            {/* status message */}
+            <text textAnchor="middle" x="50%" y="50%"
+                  fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
+                {this.state.statusMsg}
+            </text>
+
+            {/* tooltip */}
+            {this.state.withTooltip && !base.state.zoomInProgress && !base.state.brushInProgress &&
+            <Tooltip
+                name={"Tooltip"}
+                config={this.props.config}
+                signalSetsData={{}}
+                containerHeight={ySize}
+                containerWidth={xSize}
+                mousePosition={this.state.mousePosition}
+                selection={this.state.selections}
+                width={250}
+                contentRender={props => <TooltipContent {...props} labels={this.labels}/>}
+            /> }
+
+            <g ref={node => this.cursorAreaSelection = select(node)} />
+        </>);
+    }
+
+    getSvgDefs() {
+        return dotShapes;
+    }
+
     /** Gets color for signalSet
      * @param index     signalSet index in this.props.config */
     getColor(index) {
@@ -1474,16 +1480,15 @@ export class ScatterPlotBase extends Component {
     //<editor-fold desc="Cursor and Brush">
     /** Handles mouse movement to select the closest dot (for displaying its details in Tooltip, etc.).
      *  Called from this.createChart(). */
-    createChartCursor(xScale, yScale, sScale, cScales, signalSetsData) {
+    createChartCursor(signalSetsData, xScale, yScale, sScale, cScales, xSize, ySize) {
         const self = this;
 
         let selections = this.state.selections;
         let mousePosition;
 
         const selectPoints = function () {
-            const containerPos = d3Selection.mouse(self.containerNode);
-            const x = containerPos[0] - self.props.margin.left;
-            const y = containerPos[1] - self.props.margin.top;
+            const containerPos = d3Selection.mouse(self.cursorAreaSelection.node());
+            const [x, y] = containerPos;
 
             let newSelections = {};
 
@@ -1509,17 +1514,17 @@ export class ScatterPlotBase extends Component {
             }
 
             self.cursorSelectionX
-                .attr('y1', self.props.margin.top)
-                .attr('y2', self.props.height - self.props.margin.bottom)
-                .attr('x1', containerPos[0])
-                .attr('x2', containerPos[0])
+                .attr('y1', 0)
+                .attr('y2', ySize)
+                .attr('x1', x)
+                .attr('x2', x)
                 .attr('visibility', self.props.withCursor ? "visible" : "hidden");
 
             self.cursorSelectionY
-                .attr('y1', containerPos[1])
-                .attr('y2', containerPos[1])
-                .attr('x1', self.props.margin.left)
-                .attr('x2', self.renderedWidth - self.props.margin.right)
+                .attr('y1', y)
+                .attr('y2', y)
+                .attr('x1', 0)
+                .attr('x2', xSize)
                 .attr('visibility', self.props.withCursor ? "visible" : "hidden");
 
             let allNull = true;
@@ -1530,7 +1535,7 @@ export class ScatterPlotBase extends Component {
                 newSelections = null;
 
             selections = newSelections;
-            mousePosition = {x: containerPos[0], y: containerPos[1]};
+            mousePosition = {x, y};
 
             self.setState({
                 selections,
@@ -1538,7 +1543,7 @@ export class ScatterPlotBase extends Component {
             });
         };
 
-        this.brushParentSelection
+        this.cursorAreaSelection
             .on('mouseenter', selectPoints)
             .on('mousemove', selectPoints)
             .on('mouseleave', ::this.deselectPoints);
@@ -1562,137 +1567,22 @@ export class ScatterPlotBase extends Component {
         });
     }
 
-    /** Prepares the d3 brush for region selection.
-     *  Called from this.createChart(). */
-    createChartBrush() {
-        const self = this;
-
-        if (this.props.withBrush && this.state.brushInProgress) {
-            const xSize = this.renderedWidth - this.props.margin.left - this.props.margin.right;
-            const ySize = this.props.height - this.props.margin.top - this.props.margin.bottom;
-            const brush = d3Brush.brush()
-                .extent([[0, 0], [xSize, ySize]])
-                .filter(() => {
-                    // noinspection JSUnresolvedVariable
-                    return !d3Event.button // enable brush when ctrl is pressed, modified version of default brush filter (https://github.com/d3/d3-brush#brush_filter)
-                })
-                .on("start", function () {
-                    self.setState({
-                        zoomInProgress: true
-                    });
-                })
-                .on("end", function () {
-                    if (self.props.withZoom)
-                        self.setState({
-                            zoomInProgress: false
-                        });
-                    // noinspection JSUnresolvedVariable
-                    const sel = d3Event.selection;
-
-                    if (sel) {
-                        const xMin = self.xScale.invert(sel[0][0]);
-                        const xMax = self.xScale.invert(sel[1][0]);
-                        const yMin = self.yScale.invert(sel[1][1]);
-                        const yMax = self.yScale.invert(sel[0][1]);
-                        self.lastZoomCausedByUser = true;
-                        self.setZoomToLimits(xMin, xMax, yMin, yMax);
-
-                        if (self.props.withAutoRefreshOnBrush) {
-                            // load new data for brushed region
-                            self.reloadData(xMin, xMax, yMin, yMax);
-                        }
-
-                        // hide brush
-                        self.brushSelection.call(brush.move, null);
-                        self.deselectPoints();
-                        self.setState({
-                            brushInProgress: false
-                        });
-                    }
-                });
-
-            this.brushSelection
-                .attr('pointer-events', 'all')
-                .call(brush);
+    onBrush(xMin, xMax, yMin, yMax) {
+        if (this.props.withAutoRefreshOnBrush) {
+            // load new data for brushed region
+            this.reloadData(xMin, xMax, yMin, yMax);
         }
-        else {
-            this.brushParentSelection
-                .selectAll('rect')
-                .remove();
-            this.brushSelection
-                .attr('pointer-events', 'none');
+    }
 
-            this.brushParentSelection
-                .insert('rect', "g") // insert it before the brushSelection
-                .attr('pointer-events', 'all')
-                .attr('cursor', 'crosshair')
-                .attr('x', 0)
-                .attr('y', 0)
-                .attr('width', this.renderedWidth - this.props.margin.left - this.props.margin.right)
-                .attr('height', this.props.height - this.props.margin.top - this.props.margin.bottom)
-                .attr('visibility', 'hidden');
-        }
+    onBrushEnabled(brushInProgress) {
+        this.setState({brushInProgress});
     }
     //</editor-fold>
 
     //<editor-fold desc="Zoom (current view)">
-    /** Handles zoom of the chart by user using d3-zoom.
-     *  Called from this.createChart(). */
-    createChartZoom(xSize, ySize) {
-        const self = this;
-
-        const handleZoom = function () {
-            // noinspection JSUnresolvedVariable
-            if (self.props.withTransition && d3Event.sourceEvent && d3Event.sourceEvent.type === "wheel") {
-                self.lastZoomCausedByUser = true;
-                transitionInterpolate(select(self), self.state.zoomTransform, d3Event.transform, setZoomTransform(self), () => {
-                    self.deselectPoints();
-                });
-            } else {
-                // noinspection JSUnresolvedVariable
-                if (d3Event.sourceEvent && ZoomEventSources.includes(d3Event.sourceEvent.type))
-                    self.lastZoomCausedByUser = true;
-                // noinspection JSUnresolvedVariable
-                self.setState({
-                    zoomTransform: d3Event.transform
-                });
-            }
-        };
-
-        const handleZoomEnd = function () {
-            self.deselectPoints();
-            self.setState({
-                zoomInProgress: false
-            });
-            self.setLimitsToCurrentZoom();
-        };
-
-        const handleZoomStart = function () {
-            self.setState({
-                zoomInProgress: true
-            });
-        };
-
-        const zoomExtent = [[0, 0], [xSize, ySize]];
-        const translateExtent = [[0, 0], [xSize, ySize * this.state.zoomYScaleMultiplier]];
-        const zoomExisted = this.zoom !== null;
-        this.zoom = zoomExisted ? this.zoom : d3Zoom.zoom();
-        this.zoom
-            .scaleExtent([this.props.zoomLevelMin, this.props.zoomLevelMax])
-            .translateExtent(translateExtent)
-            .extent(zoomExtent)
-            .filter(() => {
-                // noinspection JSUnresolvedVariable
-                return !d3Selection.event.ctrlKey && !d3Selection.event.button && !this.state.brushInProgress;
-            })
-            .on("zoom", handleZoom)
-            .on("end", handleZoomEnd)
-            .on("start", handleZoomStart)
-            .interpolate(d3Interpolate.interpolate)
-            .wheelDelta(WheelDelta(3));
-        this.svgContainerSelection.call(this.zoom);
-        if (!zoomExisted)
-            this.setLimitsToCurrentZoom(); // initialize limits
+    onZoomEnd() {
+        this.deselectPoints();
+        this.setLimitsToCurrentZoom();
     }
 
     /**
@@ -1706,98 +1596,23 @@ export class ScatterPlotBase extends Component {
      * @param withTransition    set to true if view change should be animated (props.withTransition must be also true), default = false
      */
     setView(xMin, xMax, yMin, yMax, source, causedByUser = false, withTransition = false) {
-        if (source === this || this.state.noData)
+        if (source === this || this.state.signalSetData === null)
             return;
-
-        if (xMin === undefined) xMin = this.xScale.domain()[0];
-        if (xMax === undefined) xMax = this.xScale.domain()[1];
-        if (yMin === undefined) yMin = this.yScale.domain()[0];
-        if (yMax === undefined) yMax = this.yScale.domain()[1];
-
-        if (isNaN(xMin) || isNaN(xMax) || isNaN(yMin) || isNaN(yMax))
-            throw new Error("Parameters must be numbers.");
-
-        this.lastZoomCausedByUser = causedByUser;
-        this.setZoomToLimits(xMin, xMax, yMin, yMax, withTransition);
+        if (this.base)
+            this.base.setView(xMin, xMax, yMin, yMax, source, causedByUser, withTransition);
     }
 
     /** Returns the current view (boundaries of visible region)
      * @return {{xMin: number, xMax: number, yMin: number, yMax: number }} left, right, bottom, top boundary
      */
     getView() {
-        if (this.state.noData)
-            return undefined, undefined, undefined, undefined;
-        const [xMin, xMax] = this.xScale.domain();
-        const [yMin, yMax] = this.yScale.domain();
-        return {xMin, xMax, yMin, yMax};
+        if (this.base)
+            return this.base.getView();
     }
 
     /** updates state with current limits */
     setLimitsToCurrentZoom() {
         this.setState(this.getView());
-    }
-
-    /** sets zoom object (transform) to desired view boundaries */
-    setZoomToLimits(xMin, xMax, yMin, yMax, withTransition) {
-        const newXSize = xMax - xMin;
-        const newYSize = yMax - yMin;
-        const oldXSize = this.xScale.domain()[1] - this.xScale.domain()[0];
-        const oldYSize = this.yScale.domain()[1] - this.yScale.domain()[0];
-
-        const oldZoomYScaleMultiplier = this.state.zoomYScaleMultiplier;
-        const scaleFactor = (oldYSize * newXSize) / (oldXSize * newYSize);
-        const newZoomYScaleMultiplier =  scaleFactor * oldZoomYScaleMultiplier;
-
-        const selTopLeftInverted = this.state.zoomTransform.invert([this.xScale(xMin), this.yScale(yMax)]);
-        const transform = d3Zoom.zoomIdentity.scale(this.state.zoomTransform.k * oldXSize / newXSize).translate(-selTopLeftInverted[0], -selTopLeftInverted[1] * scaleFactor);
-
-        this.setZoom(transform, newZoomYScaleMultiplier, withTransition);
-    }
-
-    /** helper method to update zoom transform in state and zoom object */
-    setZoom(transform, yScaleMultiplier, withTransition = true) {
-        const self = this;
-        if (this.props.withZoom && this.zoom) {
-            if (this.props.withTransition && withTransition) {
-                const transition = this.svgContainerSelection.transition().duration(500)
-                    .tween("yZoom", () => function (t) {
-                        self.setState({
-                            zoomYScaleMultiplier: self.state.zoomYScaleMultiplier * (1 - t) + yScaleMultiplier * t
-                        });
-                    });
-                transition.call(this.zoom.transform, transform);
-            } else {
-                this.svgContainerSelection.call(this.zoom.transform, transform);
-                this.setState({
-                    zoomYScaleMultiplier: yScaleMultiplier
-                });
-            }
-        }
-        else {
-            if (this.props.withTransition && withTransition) {
-                this.setState({zoomInProgress: true}, () => {
-                    transitionInterpolate(this.svgContainerSelection, this.state.zoomTransform, transform,
-                        setZoomTransform(this), () => {
-                            self.setState({zoomInProgress: false});
-                            self.deselectPoints();
-                        }, 500, self.state.zoomYScaleMultiplier, yScaleMultiplier);
-                });
-            }
-            else {
-                this.setState({
-                    zoomTransform: transform,
-                    zoomYScaleMultiplier: yScaleMultiplier
-                });
-                this.deselectPoints();
-            }
-        }
-    }
-
-    callViewChangeCallback() {
-        if (typeof(this.props.viewChangeCallback) !== "function")
-            return;
-
-        this.props.viewChangeCallback(this, this.getView(), this.lastZoomCausedByUser);
     }
     //</editor-fold>
 
@@ -1824,18 +1639,15 @@ export class ScatterPlotBase extends Component {
     }
 
     zoomIn(causedByUser = true) {
-        this.lastZoomCausedByUser = causedByUser;
-        this.svgContainerSelection.transition().call(this.zoom.scaleBy, this.props.zoomLevelStepFactor);
+        this.base.zoomIn(causedByUser);
     };
 
     zoomOut(causedByUser = true) {
-        this.lastZoomCausedByUser = causedByUser;
-        this.svgContainerSelection.transition().call(this.zoom.scaleBy, 1.0 / this.props.zoomLevelStepFactor);
+        this.base.zoomOut(causedByUser);
     };
 
     resetZoom(causedByUser = true, withTransition = true) {
-        this.lastZoomCausedByUser = causedByUser;
-        this.setZoom(d3Zoom.zoomIdentity, 1, withTransition);
+        this.base.resetZoom(causedByUser, withTransition);
     }
 
     reloadData(xMin, xMax, yMin, yMax) {
@@ -1843,137 +1655,75 @@ export class ScatterPlotBase extends Component {
         this.fetchData(xMin, xMax, yMin, yMax);
     }
 
-    /** toggle between brush and zoom, returns true if brush is enabled after call */
+    /** toggle between brush and zoom */
     brushButtonClick() {
-        const brushEnabled = !this.state.brushInProgress;
-        this.setState({
-            brushInProgress: brushEnabled
-        });
-        return brushEnabled;
+        this.base.setBrushEnabled(!this.base.getState().brushInProgress);
     };
     //</editor-fold>
 
     render() {
-        if (this.state.noData) {
-            return (
-                <svg ref={node => this.containerNode = node} height={this.props.height} width="100%"
-                     className={this.props.className} style={this.props.style} >
-                    <text textAnchor="middle" x="50%" y="50%"
-                          fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                        {this.state.statusMsg}
-                    </text>
-                </svg>
-            );
-        }
-        else {
-            this.dotHighlightSelections = {};
-            const dotsHighlightSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
-                <g key={signalSet.cid + "-" + i}
-                   ref={node => this.dotHighlightSelections[signalSet.cid + "-" + i] = select(node)}/>
-            );
+        return (
+            <div className={this.props.className} style={this.props.style} >
+                {this.props.withToolbar && !this.state.noData &&
+                <ScatterPlotToolbar resetZoomClick={::this.resetZoom}
+                                    zoomInClick={this.props.withZoom ? ::this.zoomIn : undefined}
+                                    zoomOutClick={this.props.withZoom ? ::this.zoomOut : undefined}
+                                    reloadDataClick={::this.reloadData}
+                                    brushClick={this.props.withBrush ? ::this.brushButtonClick : undefined}
+                                    brushInProgress={this.state.brushInProgress}
 
-            this.dotsSelection = {};
-            const dotsSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
-                <g key={signalSet.cid + "-" + i}
-                   ref={node => this.dotsSelection[signalSet.cid + "-" + i] = select(node)}/>
-            );
+                                    withSettings={this.props.withSettings}
+                                    settings={{
+                                        xMin: this.state.xMin,
+                                        xMax: this.state.xMax,
+                                        yMin: this.state.yMin,
+                                        yMax: this.state.yMax,
+                                        withTooltip: this.state.withTooltip,
+                                        maxDotCount: this.state.maxDotCount
+                                    }}
+                                    setLimits={::this.setView}
+                                    setSettings={::this.setSettings}
+                />}
 
-            this.dotsGlobalSelection = {};
-            const dotsGlobalSelectionGroups = this.props.config.signalSets.map((signalSet, i) =>
-                <g key={signalSet.cid + "-" + i}
-                   ref={node => this.dotsGlobalSelection[signalSet.cid + "-" + i] = select(node)}/>
-            );
+                <ZoomableChartBase
+                    ref={node => this.base = node}
 
-            return (
-                <div className={this.props.className} style={this.props.style} >
-                    {this.props.withToolbar &&
-                    <ScatterPlotToolbar resetZoomClick={::this.resetZoom}
-                                        zoomInClick={this.props.withZoom ? ::this.zoomIn : undefined}
-                                        zoomOutClick={this.props.withZoom ? ::this.zoomOut : undefined}
-                                        reloadDataClick={::this.reloadData}
-                                        brushClick={this.props.withBrush ? ::this.brushButtonClick : undefined}
-                                        brushInProgress={this.state.brushInProgress}
+                    height={this.props.height}
+                    margin={this.props.margin}
+                    withOverviewX={false}
+                    withOverviewY={false}
+                    withTransition={this.props.withTransition}
+                    withZoomX={this.props.withZoom}
+                    withZoomY={this.props.withZoom}
+                    withBrush={this.props.withBrush}
 
-                                        withSettings={this.props.withSettings}
-                                        settings={{
-                                            xMin: this.state.xMin,
-                                            xMax: this.state.xMax,
-                                            yMin: this.state.yMin,
-                                            yMax: this.state.yMax,
-                                            withTooltip: this.state.withTooltip,
-                                            maxDotCount: this.state.maxDotCount
-                                        }}
-                                        setLimits={::this.setView}
-                                        setSettings={::this.setSettings}
-                    />}
+                    getXScale={::this.getXScale}
+                    getYScale={::this.getYScale}
+                    statusMsg={this.state.statusMsg}
 
-                    <div ref={node => this.svgContainerSelection = select(node)} className={`${styles.touchActionNone} ${styles.clearBoth}`}>
-                        <svg id="cnt" ref={node => this.containerNode = node} height={this.props.height} width="100%">
-                            <defs>
-                                <clipPath id="plotRect">
-                                    <rect x="0" y="0" width={this.state.width - this.props.margin.left - this.props.margin.right} height={this.props.height - this.props.margin.top - this.props.margin.bottom} />
-                                </clipPath>
-                                {/* dot shape definitions */}
-                                {dotShapes}
-                            </defs>
-                            <g transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} clipPath="url(#plotRect)" ref={node => this.chartSelection = select(node)} >
-                                <g name={"regressions"} ref={node => this.regressionsSelection = select(node)}/>
-                                <g name={"dots_global"}>{dotsGlobalSelectionGroups}</g>
-                                <g name={"dots"}>{dotsSelectionGroups}</g>
-                                <g name={"highlightDots"} visibility={(this.props.withCursor || this.state.withTooltip) && !this.state.zoomInProgress ? "visible" : "hidden"} >{dotsHighlightSelectionGroups}</g>
-                            </g>
+                    createChart={::this.createChart}
+                    getGraphContent={::this.getGraphContent}
+                    getSvgDefs={::this.getSvgDefs}
+                    onZoomEnd={::this.onZoomEnd}
+                    onBrush={::this.onBrush}
+                    onBrushEnabled={::this.onBrushEnabled}
 
-                            {/* axes */}
-                            <g ref={node => this.xAxisSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.height - this.props.margin.bottom})`}/>
-                            <text ref={node => this.xAxisLabelSelection = select(node)}
-                                  transform={`translate(${this.props.margin.left + (this.state.width - this.props.margin.left - this.props.margin.right) / 2}, ${this.props.height - 5})`} />
-                            <g ref={node => this.yAxisSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`}/>
-                            <text ref={node => this.yAxisLabelSelection = select(node)}
-                                  transform={`translate(${15}, ${this.props.margin.top + (this.props.height - this.props.margin.top - this.props.margin.bottom) / 2}) rotate(-90)`} />
+                    xAxisTicksCount={this.props.xAxisTicksCount}
+                    xAxisTicksFormat={this.props.xAxisTicksFormat}
+                    xAxisLabel={this.props.xAxisLabel}
+                    yAxisTicksCount={this.props.yAxisTicksCount}
+                    yAxisTicksFormat={this.props.yAxisTicksFormat}
+                    yAxisLabel={this.props.yAxisLabel}
 
-                            {/* cursor lines */}
-                            {!this.state.zoomInProgress &&
-                            <line ref={node => this.cursorSelectionX = select(node)} strokeWidth="1"
-                                  stroke="rgb(50,50,50)"
-                                  visibility="hidden"/> }
-                            {!this.state.zoomInProgress &&
-                            <line ref={node => this.cursorSelectionY = select(node)} strokeWidth="1"
-                                  stroke="rgb(50,50,50)"
-                                  visibility="hidden"/> }
-
-                            {/* status message */}
-                            <text textAnchor="middle" x="50%" y="50%"
-                                  fontFamily="'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif" fontSize="14px">
-                                {this.state.statusMsg}
-                            </text>
-
-                            {/* tooltip */}
-                            {this.state.withTooltip && !this.state.zoomInProgress &&
-                            <Tooltip
-                                name={"Tooltip"}
-                                config={this.props.config}
-                                signalSetsData={{}}
-                                containerHeight={this.props.height}
-                                containerWidth={this.state.width}
-                                mousePosition={this.state.mousePosition}
-                                selection={this.state.selections}
-                                width={250}
-                                contentRender={props => <TooltipContent {...props} labels={this.labels}/>}
-                            /> }
-
-                            {/* brush */}
-                            <g ref={node => this.brushParentSelection = select(node)}
-                               transform={`translate(${this.props.margin.left}, ${this.props.margin.top})`} >
-                                <g ref={node => this.brushSelection = select(node)} />
-                            </g>
-                        </svg>
-                    </div>
-                    {this.props.withRegressionCoefficients &&
-                    <div ref={node => this.regressionsCoefficients = select(node)} className={styles.regressionsCoefficients}/>}
-                </div>
-            );
-        }
+                    viewChangeCallback={this.props.viewChangeCallback}
+                    zoomLevelMin={this.props.zoomLevelMin}
+                    zoomLevelMax={this.props.zoomLevelMax}
+                    className={this.props.className}
+                    style={this.props.style}
+                />
+                {this.props.withRegressionCoefficients &&
+                <div ref={node => this.regressionsCoefficients = select(node)} className={styles.regressionsCoefficients}/>}
+            </div>
+        );
     }
 }
